@@ -12,7 +12,7 @@ This chart has two operating profiles selected by values:
 ## Quickstart (eval only)
 
 ```sh
-helm install buzz oci://ghcr.io/block/buzz/charts/buzz --version 0.1.7 \
+helm install buzz oci://ghcr.io/block/buzz/charts/buzz --version 0.1.8 \
   --create-namespace --namespace buzz \
   --set quickstart=true \
   --set postgresql.enabled=true \
@@ -28,6 +28,15 @@ its bucket created by a post-install Job) — and composes the relay's
 intent marker surfaced in NOTES.txt; the bundled services are opted in via the
 four `*.enabled` flags above (see `ci/quickstart-values.yaml` for the exact set
 CI installs). Eval-only: every bundled service is a single replica with no HA.
+
+For immutable delivery, pin the OCI digest instead of a tag. `image.digest`
+overrides `image.tag` when both are present:
+
+```yaml
+image:
+  repository: ghcr.io/block/buzz
+  digest: sha256:<64-lowercase-hex-characters>
+```
 
 ## Production (GitOps)
 
@@ -204,6 +213,8 @@ default so long-lived WebSocket connections have time to drain.
 ## Upgrades
 
 Schema migrations are embedded in the relay binary via `sqlx::migrate!` and run at startup, gated by `BUZZ_AUTO_MIGRATE` (default `true`). Multiple replicas race-safely behind a Postgres advisory lock. `helm upgrade` is the entire upgrade procedure.
+
+Migration 0032 is a hard compatibility boundary for relay versions that publish repaired channel rosters. The relay verifies the roster-fence trigger catalog and behavior before opening listeners and refuses to start if 0032 is missing or inert. Apply migrations before rolling the relay; for large installations, prefer a controlled `buzz-admin migrate` job with PostgreSQL lock monitoring before the code rollout.
 
 If you prefer decoupling migrations from serving, set `migrate.autoMigrate=false`. **In that mode the chart does not run migrations for you** — you own running `buzz-admin migrate` (separate Pod / one-shot Job) against the database before every `helm install` / `helm upgrade`. Readiness probes only verify DB connectivity, not schema freshness, so a pod will appear healthy against an unmigrated schema and fail under load. A pre-upgrade Helm Job for this is on the chart roadmap; the values knob `migrate.preUpgradeJob.enabled` is reserved.
 

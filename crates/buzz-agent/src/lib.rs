@@ -8,10 +8,12 @@ mod handoff;
 mod hints;
 mod llm;
 mod mcp;
+pub mod model_capabilities;
+mod permission;
 pub mod types;
 mod wire;
 
-pub use catalog::{discover_databricks_models, ModelEntry, DATABRICKS_V2_KNOWN_MODELS};
+pub use catalog::{discover_databricks_models, ModelEntry};
 pub use config::Provider;
 pub use types::AgentError;
 
@@ -31,6 +33,7 @@ pub const WINDOWS_SHELL_RESOLUTION_ENV: &[&str] = &[
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -53,6 +56,17 @@ struct App {
     cfg: Config,
     llm: Arc<Llm>,
     sessions: Mutex<HashMap<String, Session>>,
+    /// ACP protocol version negotiated at `initialize`, stored for the whole
+    /// connection lifetime. The `session/request_permission` wire shape derives
+    /// from this value — never from a later mutable session field — so a strict
+    /// client always receives exactly the shape it negotiated. Defaults to
+    /// [`PROTOCOL_VERSION`] before `initialize`; no prompt (and thus no
+    /// permission ask) can run before then.
+    negotiated_version: AtomicU32,
+    /// Owns the entire `session/request_permission` correlation lifecycle:
+    /// process-wide admission, id allocation, response delivery, and abort-safe
+    /// cleanup. See [`permission::PermissionBroker`].
+    permissions: Arc<permission::PermissionBroker>,
     /// Cached model catalog for Databricks providers. Populated lazily on the
     /// first successful `session/new` discovery call. Failed discovery is never
     /// cached: static-token authentication errors reject session creation, while
@@ -180,28 +194,53 @@ async fn async_main() {
     let cfg = Config::from_env().unwrap_or_else(|e| die(e));
     let llm = Arc::new(Llm::new(&cfg).unwrap_or_else(|e| die(e.to_string())));
     let max_line = cfg.max_line_bytes;
+    let permissions = Arc::new(permission::PermissionBroker::new(
+        cfg.max_pending_permissions,
+        cfg.permission_timeout,
+    ));
     let app = Arc::new(App {
         cfg,
         llm,
         sessions: Mutex::new(HashMap::new()),
+        negotiated_version: AtomicU32::new(PROTOCOL_VERSION),
+        permissions,
         models_cache: tokio::sync::OnceCell::new(),
     });
     let (wire_tx, wire_rx) = mpsc::channel::<WireMsg>(64);
-    let writer = tokio::spawn(wire::writer_task(wire_rx));
-    if let Err(e) = read_loop(
-        BufReader::new(tokio::io::stdin()),
-        app.clone(),
-        wire_tx,
-        max_line,
-    )
-    .await
-    {
-        tracing::error!("io: reader: {e}");
+    let mut writer = tokio::spawn(wire::writer_task(wire_rx));
+    // Whichever ends first drives shutdown. The reader ending is the normal
+    // path (stdin EOF/error). The writer ending while the reader still runs
+    // means stdout is closed/broken: no reply can ever be written, so we must
+    // stop reading and cancel every session rather than leave the process
+    // reading input while outstanding permission asks wait out their full
+    // deadline for a response that can never arrive.
+    tokio::select! {
+        r = read_loop(
+            BufReader::new(tokio::io::stdin()),
+            app.clone(),
+            wire_tx,
+            max_line,
+        ) => {
+            if let Err(e) = r {
+                tracing::error!("io: reader: {e}");
+            }
+            cancel_all_sessions(&app).await;
+            let _ = writer.await;
+        }
+        _ = &mut writer => {
+            tracing::error!("io: writer exited (stdout closed); shutting down connection");
+            cancel_all_sessions(&app).await;
+        }
     }
+}
+
+/// Signal every live session to cancel. Run on connection teardown so in-flight
+/// prompts — including any waiting on a `session/request_permission` response —
+/// resolve promptly instead of waiting out their deadline.
+async fn cancel_all_sessions(app: &Arc<App>) {
     for session in app.sessions.lock().await.values() {
         let _ = session.cancel_tx.send(true);
     }
-    let _ = writer.await;
 }
 
 async fn read_loop<R: tokio::io::AsyncBufRead + Unpin>(
@@ -234,7 +273,10 @@ async fn dispatch(app: &Arc<App>, msg: Value, wire_tx: &WireSender) {
             handle_request(app, id, method, params, wire_tx).await
         }
         Inbound::Notification { method, params } => handle_notification(app, &method, params).await,
-        Inbound::Ignored => {}
+        // Client's answer to a `session/request_permission` we issued. The
+        // broker matches it to a live correlation id (waking that waiter) or
+        // ignores an unknown/late id.
+        Inbound::Response { id, result } => app.permissions.deliver(&id, result),
         Inbound::Invalid { id, code, message } => {
             wire::send(wire_tx, wire::err(id, code, &message)).await
         }
@@ -249,7 +291,7 @@ async fn handle_request(
     wire_tx: &WireSender,
 ) {
     match method.as_str() {
-        "initialize" => initialize(id, params, wire_tx).await,
+        "initialize" => initialize(app, id, params, wire_tx).await,
         "session/new" => {
             let app = app.clone();
             let wire_tx = wire_tx.clone();
@@ -290,7 +332,7 @@ async fn handle_notification(app: &Arc<App>, method: &str, params: Value) {
     }
 }
 
-async fn initialize(id: Value, params: Value, wire_tx: &WireSender) {
+async fn initialize(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
     let p: InitializeParams = match decode(params, "initialize") {
         Ok(p) => p,
         Err(m) => return reject(wire_tx, id, INVALID_PARAMS, &m).await,
@@ -302,6 +344,12 @@ async fn initialize(id: Value, params: Value, wire_tx: &WireSender) {
     // RFD. Revisit when that RFD merges; otherwise a genuine upstream-v2 agent
     // would silently lose `[Base]`.
     let negotiated_version = p.protocol_version.min(PROTOCOL_VERSION);
+    // Store the negotiated version for the connection lifetime: the
+    // `session/request_permission` wire shape derives from this value, never
+    // from a later mutable session field, so a strict client always receives
+    // exactly the shape it negotiated at `initialize`.
+    app.negotiated_version
+        .store(negotiated_version, Ordering::Relaxed);
     wire::send(
         wire_tx,
         wire::ok(
@@ -339,12 +387,15 @@ async fn resolve_models_catalog(
 ///
 /// This value is never written to `models_cache`; failed discovery must be retried by
 /// the next session rather than pinning degraded state for the process lifetime.
+///
+/// Only reached from the Databricks provider arm below, so the curated label is
+/// looked up from the Databricks manifest; `id` stays the raw configured value.
 fn configured_model_fallback(model: &str) -> Vec<ModelEntry> {
     let model = model.trim().to_string();
-    vec![ModelEntry {
-        id: model.clone(),
-        name: model,
-    }]
+    let name = crate::model_capabilities::databricks_registry_label(&model)
+        .unwrap_or(&model)
+        .to_string();
+    vec![ModelEntry { id: model, name }]
 }
 
 async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
@@ -730,6 +781,8 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
         system_prompt: &effective_system_prompt,
         llm: &app.llm,
         mcp: &mcp,
+        permissions: &app.permissions,
+        protocol_version: app.negotiated_version.load(Ordering::Relaxed),
         skills: &skills,
         wire: &wire_tx,
         cancel: &mut cancel_rx,
@@ -1010,11 +1063,25 @@ mod tests {
 
     #[test]
     fn configured_model_fallback_is_trimmed_and_singular() {
+        // Unknown id: trimmed, and the raw id passes through as the name.
         assert_eq!(
             crate::configured_model_fallback("  configured-model  "),
             vec![ModelEntry {
                 id: "configured-model".into(),
                 name: "configured-model".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn configured_model_fallback_curates_known_databricks_id() {
+        // A configured Databricks id known to the manifest gets its curated
+        // label; `id` stays the raw wire/config value.
+        assert_eq!(
+            crate::configured_model_fallback("databricks-gpt-5-5"),
+            vec![ModelEntry {
+                id: "databricks-gpt-5-5".into(),
+                name: "GPT-5.5".into(),
             }]
         );
     }
