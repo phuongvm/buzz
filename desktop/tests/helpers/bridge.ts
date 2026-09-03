@@ -56,6 +56,7 @@ type MockSearchProfileSeed = {
 
 type MockRelayAgentSeed = {
   pubkey: string;
+  ownerPubkey?: string | null;
   name: string;
   agentType?: string;
   capabilities?: string[];
@@ -63,7 +64,7 @@ type MockRelayAgentSeed = {
   respondToAllowlist?: string[];
   channelNames?: string[];
   channelIds?: string[];
-  status?: "online" | "away" | "offline";
+  status?: "online" | "away" | "offline" | "unknown";
 };
 
 type MockHuddleSeed = {
@@ -250,6 +251,10 @@ type MockBridgeOptions = {
   /** Outcomes for successive explicit persona share publications. */
   personaSharePublicationStatuses?: Array<"published" | "queued">;
   teams?: MockTeamSeed[];
+  /** Community team-catalog (kind:30178) heads returned by relay queries. */
+  teamCatalogEvents?: RelayEvent[];
+  /** Outcomes for successive explicit team share publications. */
+  teamSharePublicationStatuses?: Array<"published" | "queued">;
   relayAgents?: MockRelayAgentSeed[];
   /** Reject successive relay-agent directory reads, then resume. */
   relayAgentListErrors?: (string | null)[];
@@ -296,11 +301,24 @@ type MockBridgeOptions = {
   closeChannelLiveSubscriptionOnce?: boolean;
   /** Reject successive kind-9 sends with these messages, then resume. */
   sendMessageErrors?: string[];
+  /** Test-only observer control results emitted after mock control publishes. */
+  observerControlResults?: Array<{
+    type: "cancel_turn" | "switch_model";
+    status: string;
+    channelId?: string | null;
+    requestId?: string;
+    modelId?: string;
+  }>;
   /** Reject successive managed-agent starts, then resume. */
   startManagedAgentErrors?: string[];
   /** Delay (ms) after snapshotting a thread-replies page so E2E tests can
    * deliver live reply/aux events while an older response is in flight. */
   threadRepliesDelayMs?: number;
+  /** Hold every `get_thread_replies` response until
+   * `__BUZZ_E2E_RELEASE_THREAD_REPLIES__()` is called — a manual gate the test
+   * releases explicitly, so the thread-aux backfill provably cannot land (and
+   * heal a stale head) before assertions run. See e2eBridge mock config. */
+  deferThreadReplies?: boolean;
   usersBatchDelayMs?: number;
   /** Delay (ms) for older-history fetches; see e2eBridge mock config. */
   channelWindowDelayMs?: number;
