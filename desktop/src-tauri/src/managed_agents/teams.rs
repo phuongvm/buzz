@@ -165,7 +165,7 @@ pub(crate) fn load_teams_readonly(path: &std::path::Path) -> Result<Vec<TeamReco
     let records = if path.exists() {
         let content = fs::read_to_string(path)
             .map_err(|error| format!("failed to read teams store: {error}"))?;
-        serde_json::from_str::<Vec<TeamRecord>>(&content)
+        serde_json::from_str::<Vec<TeamRecord>>(crate::util::trim_bom(&content))
             .map_err(|error| format!("failed to parse teams store: {error}"))?
     } else {
         Vec::new()
@@ -183,7 +183,7 @@ pub fn load_teams<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<TeamRecor
     let records = if path.exists() {
         let content = fs::read_to_string(&path)
             .map_err(|error| format!("failed to read teams store: {error}"))?;
-        serde_json::from_str::<Vec<TeamRecord>>(&content)
+        serde_json::from_str::<Vec<TeamRecord>>(crate::util::trim_bom(&content))
             .map_err(|error| format!("failed to parse teams store: {error}"))?
     } else {
         Vec::new()

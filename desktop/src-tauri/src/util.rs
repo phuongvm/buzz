@@ -42,6 +42,15 @@ pub fn slugify(name: &str, fallback: &str, max_len: usize) -> String {
     raw.trim_end_matches('-').to_string()
 }
 
+/// Trim a leading UTF-8 Byte Order Mark (BOM, U+FEFF) from a string if present.
+///
+/// Windows text editors and PowerShell often write UTF-8 files with a leading BOM.
+/// Standard `serde_json::from_str` does not skip this mark and fails with
+/// "expected value at line 1 column 1" unless it is stripped.
+pub fn trim_bom(s: &str) -> &str {
+    s.trim_start_matches('\u{feff}')
+}
+
 // ── Safe symlink utilities ────────────────────────────────────────────────────
 
 /// Create a symlink at `link` pointing to `target` on Unix; no-op on Windows.
@@ -284,6 +293,19 @@ pub(crate) fn resolved_backup_path(
 #[cfg(test)]
 mod tests {
     use super::slugify;
+
+    #[test]
+    fn trim_bom_strips_leading_feff() {
+        assert_eq!(
+            super::trim_bom("\u{feff}{\"key\": \"value\"}"),
+            "{\"key\": \"value\"}"
+        );
+        assert_eq!(
+            super::trim_bom("{\"key\": \"value\"}"),
+            "{\"key\": \"value\"}"
+        );
+        assert_eq!(super::trim_bom(""), "");
+    }
 
     #[test]
     fn double_option_tristate() {

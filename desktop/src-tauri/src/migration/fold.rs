@@ -50,7 +50,7 @@ fn fold_personas_in_dir(base_dir: &Path) -> Result<Option<usize>, String> {
     let mut all: Vec<crate::managed_agents::ManagedAgentRecord> = if agents_path.exists() {
         let content = std::fs::read_to_string(&agents_path)
             .map_err(|e| format!("failed to read managed-agents.json: {e}"))?;
-        serde_json::from_str(&content)
+        serde_json::from_str(crate::util::trim_bom(&content))
             .map_err(|e| format!("failed to parse managed-agents.json: {e}"))?
     } else {
         Vec::new()

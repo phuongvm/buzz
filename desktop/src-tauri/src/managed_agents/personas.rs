@@ -373,7 +373,7 @@ pub(crate) fn load_personas_from_path(
     }
     let content = fs::read_to_string(path)
         .map_err(|error| format!("failed to read persona store: {error}"))?;
-    serde_json::from_str::<Vec<AgentDefinition>>(&content)
+    serde_json::from_str::<Vec<AgentDefinition>>(crate::util::trim_bom(&content))
         .map_err(|error| format!("failed to parse persona store: {error}"))
 }
 

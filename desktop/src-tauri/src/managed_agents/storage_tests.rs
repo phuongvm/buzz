@@ -346,6 +346,15 @@ fn restricted_write_lands_owner_only_without_post_write_chmod() {
 }
 
 #[test]
+fn agent_store_deserialization_tolerates_utf8_bom() {
+    let with_bom = "\u{feff}[{\"name\":\"bom-agent\"}]";
+    let records: Vec<ManagedAgentRecord> =
+        serde_json::from_str(crate::util::trim_bom(with_bom)).expect("deserialization with BOM");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].name, "bom-agent");
+}
+
+#[test]
 fn meaningful_agent_error_from_log_promotes_wrapped_llm_auth() {
     let file =
         write_log("noise\nAgent reported error (code -32001): llm auth: 401 unauthorized: ...\n");
