@@ -21,13 +21,16 @@ import {
 } from "@/features/profile/lib/identity";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { useAgentAvailability } from "@/features/agents/lib/useAgentAvailability";
-import { useUserStatusQuery } from "@/features/user-status/hooks";
+import {
+  useUserStatusQuery,
+  visibleUserStatus,
+} from "@/features/user-status/hooks";
 import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import { ProfileAvatarWithStatus } from "@/features/profile/ui/ProfileAvatarWithStatus";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { cn } from "@/shared/lib/cn";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import { useProfileInteractionActions } from "@/features/profile/ui/useProfileInteractionActions";
 
 import {
@@ -105,7 +108,7 @@ function HoverPubkeyName({
       <span
         className={`${TEXT_SWAP_BASE_CLASS} ${TEXT_SWAP_HIDDEN_CLASS} ${TEXT_SWAP_HOVER_VISIBLE_CLASS}`}
       >
-        {truncatePubkey(pubkey)}
+        {truncateNpub(pubkey)}
       </span>
     </span>
   );
@@ -294,7 +297,7 @@ function UserProfilePopoverBody({
       relayAgentsQuery.isPending ||
       managedAgentsQuery.isPending ||
       usersBatchQuery.isPending);
-  const displayName = profile?.displayName ?? truncatePubkey(pubkey);
+  const displayName = profile?.displayName ?? truncateNpub(pubkey);
   // Owner signal mirrors UserProfilePanel: a declared NIP-OA owner whose agent
   // runs elsewhere holds no local seckey, so key custody (`isOwner`) alone
   // wrongly hides the affordance from them — and gating on bot-ness alone shows
@@ -333,7 +336,9 @@ function UserProfilePopoverBody({
     showHumanProfileActions || showMessageAction || showHuddleAction;
   const canViewActivity =
     isBotProfile && viewerIsOwner && canOpenAgentActivity(pubkey);
-  const userStatus = userStatusQuery.data?.[pubkey.toLowerCase()];
+  const userStatus = visibleUserStatus(
+    userStatusQuery.data?.[pubkey.toLowerCase()],
+  );
   const userStatusText = userStatus?.text.trim() ?? "";
   const hasUserStatus = Boolean(userStatusText || userStatus?.emoji);
   const profileDescription = profile?.about?.trim() ?? "";
