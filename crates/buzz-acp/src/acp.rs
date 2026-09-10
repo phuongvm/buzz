@@ -508,7 +508,8 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if std::env::var_os(key).is_none() {
+            // Authoritative agent-scoped credentials (BUZZ_*) must always override parent environment.
+            if key.starts_with("BUZZ_") || std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
         }

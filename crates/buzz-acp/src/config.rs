@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::ValueEnum;
-use nostr::Keys;
+use nostr::{Keys, ToBech32};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -1136,6 +1136,21 @@ impl Config {
         // instructions arrive independently so they can be layered at runtime.
         let mut persona_env_vars = Vec::new();
         let model = args.model;
+
+        // Forward the agent's authoritative credentials to the agent subprocess so
+        // child tools (like hermes terminal) have the correct identity keys.
+        persona_env_vars.push((
+            "BUZZ_PRIVATE_KEY".to_string(),
+            keys.secret_key()
+                .to_bech32()
+                .expect("secret key bech32 encoding should never fail"),
+        ));
+        persona_env_vars.push(("BUZZ_RELAY_URL".to_string(), args.relay_url.clone()));
+        if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+            if !auth_tag.is_empty() {
+                persona_env_vars.push(("BUZZ_AUTH_TAG".to_string(), auth_tag));
+            }
+        }
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
