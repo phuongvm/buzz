@@ -1151,6 +1151,12 @@ impl Config {
                 persona_env_vars.push(("BUZZ_AUTH_TAG".to_string(), auth_tag));
             }
         }
+        if let Ok(reply_in_thread) = std::env::var("BUZZ_REPLY_IN_THREAD") {
+            persona_env_vars.push(("BUZZ_REPLY_IN_THREAD".to_string(), reply_in_thread));
+        }
+        if let Ok(reply_to_mode) = std::env::var("BUZZ_REPLY_TO_MODE") {
+            persona_env_vars.push(("BUZZ_REPLY_TO_MODE".to_string(), reply_to_mode));
+        }
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op

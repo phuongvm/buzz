@@ -1377,17 +1377,37 @@ pub(crate) fn format_event_block(
 
 /// Append a reply instruction when the agent is responding to a thread event.
 ///
+fn is_direct_reply_enforced() -> bool {
+    std::env::var("BUZZ_REPLY_IN_THREAD")
+        .map(|v| v == "false" || v == "0")
+        .unwrap_or(false)
+        || std::env::var("BUZZ_REPLY_TO_MODE")
+            .map(|v| v.eq_ignore_ascii_case("off"))
+            .unwrap_or(false)
+        || std::env::var("BUZZ_DIRECT_REPLIES_ONLY")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
+}
+
 /// Tells the agent to default to `--reply-to <event_id>` for ordinary replies
 /// while still allowing an explicit human request to post at the channel root or
 /// top level.
 fn append_reply_instruction(s: &mut String, event_id: &str) {
-    s.push_str(&format!(
-        "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
-         on `buzz messages send` so the conversation stays threaded. \
-         If the human explicitly asks for a channel-root, top-level, \
-         or broadcast post, send that message without `--reply-to`. \
-         If the requested destination is ambiguous, ask before sending."
-    ));
+    if is_direct_reply_enforced() {
+        s.push_str(
+            "\nIMPORTANT: Direct replies are enforced in this workspace. All replies in this \
+             turn MUST be sent directly to the channel root without `--reply-to` on `buzz messages send`. \
+             Do NOT reply in threads.",
+        );
+    } else {
+        s.push_str(&format!(
+            "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
+             on `buzz messages send` so the conversation stays threaded. \
+             If the human explicitly asks for a channel-root, top-level, \
+             or broadcast post, send that message without `--reply-to`. \
+             If the requested destination is ambiguous, ask before sending."
+        ));
+    }
 }
 
 /// Append a new-thread reply instruction for a human-facing top-level mention.
@@ -1396,13 +1416,21 @@ fn append_reply_instruction(s: &mut String, event_id: &str) {
 /// thread root. Anchoring to the triggering event (rather than leaving the
 /// choice open) prevents replying into a stale/unrelated prior thread.
 fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
-    s.push_str(&format!(
-        "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
-         this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
-         triggering message is the thread root. Do NOT reply into any other \
-         (older) thread. If the human explicitly asks for a channel-root, \
-         top-level, or broadcast post, send that message without `--reply-to`."
-    ));
+    if is_direct_reply_enforced() {
+        s.push_str(
+            "\nIMPORTANT: Direct replies are enforced in this workspace. All replies in this \
+             turn MUST be sent directly to the channel root without `--reply-to` on `buzz messages send`. \
+             Do NOT reply in threads.",
+        );
+    } else {
+        s.push_str(&format!(
+            "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
+             this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
+             triggering message is the thread root. Do NOT reply into any other \
+             (older) thread. If the human explicitly asks for a channel-root, \
+             top-level, or broadcast post, send that message without `--reply-to`."
+        ));
+    }
 }
 
 /// Decide whether a turn is human-facing for reply-anchor purposes.
@@ -5535,6 +5563,24 @@ mod tests {
             prompt.contains("new top-level message"),
             "batched top-level-last prompt should use the new-thread instruction"
         );
+    }
+
+    #[test]
+    fn test_direct_reply_enforced_instruction() {
+        let mut s = String::new();
+        // Without env, regular instruction is appended
+        append_reply_instruction(&mut s, "abc");
+        assert!(s.contains("--reply-to abc"));
+
+        // With BUZZ_REPLY_IN_THREAD=false, direct reply directive is appended
+        std::env::set_var("BUZZ_REPLY_IN_THREAD", "false");
+        let mut s_direct = String::new();
+        append_reply_instruction(&mut s_direct, "abc");
+        assert!(s_direct.contains("Direct replies are enforced"));
+        assert!(!s_direct.contains("--reply-to abc"));
+
+        // Cleanup
+        std::env::remove_var("BUZZ_REPLY_IN_THREAD");
     }
 
     /// Build a single-event FlushBatch with the given content.
