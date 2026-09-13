@@ -1717,13 +1717,14 @@ async fn create_session_and_apply_model(
     );
 
     // Apply permission mode if not the agent's built-in default AND the agent
-    // advertises the requested mode in session/new. Agents that don't support
+    // advertises the requested mode in session/new (or an equivalent wire alias
+    // such as codex-acp's "agent-full-access"). Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
     // are safely skipped — the harness auto-approves via handle_permission_request.
-    if !ctx.permission_mode.is_default()
-        && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
-    {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+    if !ctx.permission_mode.is_default() {
+        if let Some(mode_wire) = resolve_permission_mode_wire(&resp.raw, &ctx.permission_mode) {
+            apply_permission_mode(&mut agent.acp, &resp.session_id, mode_wire).await?;
+        }
     }
 
     Ok(resp.session_id)
@@ -1974,6 +1975,25 @@ fn patch_config_option_current_value(
 ///
 /// Non-fatal for most errors: logs and proceeds. The agent falls back
 /// to its default permission mode (`"default"`), which still works via
+/// Resolve the wire-format permission mode string to send to the agent,
+/// handling agent-specific mode names (such as `agent-full-access` for `codex-acp`).
+fn resolve_permission_mode_wire<'a>(
+    session_new_result: &serde_json::Value,
+    mode: &'a PermissionMode,
+) -> Option<&'a str> {
+    let wire = mode.as_wire_str();
+    if agent_supports_mode(session_new_result, wire) {
+        return Some(wire);
+    }
+    // Codex-acp compatibility: maps bypassPermissions to agent-full-access
+    if matches!(mode, PermissionMode::BypassPermissions)
+        && agent_supports_mode(session_new_result, "agent-full-access")
+    {
+        return Some("agent-full-access");
+    }
+    None
+}
+
 /// Check if the agent's `session/new` response advertises a given mode ID
 /// in `result.modes.availableModes[].id`. Returns `false` if the modes
 /// field is absent or the mode isn't listed.
@@ -1997,9 +2017,8 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
 async fn apply_permission_mode(
     acp: &mut AcpClient,
     session_id: &str,
-    mode: &PermissionMode,
+    wire: &str,
 ) -> Result<(), AcpError> {
-    let wire = mode.as_wire_str();
     let result = tokio::time::timeout(PERMISSION_MODE_TIMEOUT, async {
         acp.session_set_config_option(session_id, "mode", wire)
             .await
@@ -3174,6 +3193,46 @@ pub async fn run_prompt_task(
                     standing_sent,
                     &pending_delivered_event_ids,
                 );
+
+                let turn_text = agent.acp.take_turn_text();
+                let has_published = agent.acp.turn_has_published_message();
+
+                if matches!(stop_reason, StopReason::EndTurn)
+                    && !has_published
+                    && is_auto_publish_fallback_enabled()
+                {
+                    if let Some(ref b) = batch {
+                        let clean_text = clean_thinking_tags(&turn_text);
+                        let trimmed = clean_text.trim();
+                        if !trimmed.is_empty() {
+                            tracing::info!(
+                                channel = %scope.channel_id(),
+                                text_len = trimmed.len(),
+                                "auto-publishing agent text response fallback to channel"
+                            );
+                            let thread_tags = b
+                                .events
+                                .last()
+                                .map(|e| crate::queue::parse_thread_tags(&e.event))
+                                .unwrap_or_default();
+                            let mentions: Vec<String> = b
+                                .events
+                                .last()
+                                .filter(|e| e.event.pubkey != ctx.agent_keys.public_key())
+                                .map(|e| vec![e.event.pubkey.to_hex()])
+                                .unwrap_or_default();
+
+                            post_auto_publish_message(
+                                &ctx.rest_client,
+                                scope.channel_id(),
+                                &thread_tags,
+                                &mentions,
+                                trimmed,
+                            )
+                            .await;
+                        }
+                    }
+                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
@@ -5222,6 +5281,91 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
+/// Check if auto-publish fallback for agent conversational text is enabled.
+pub(crate) fn is_auto_publish_fallback_enabled() -> bool {
+    std::env::var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK")
+        .map(|v| v != "false" && v != "0" && !v.eq_ignore_ascii_case("off"))
+        .unwrap_or(true)
+}
+
+/// Strip <think>...</think> blocks from model output if present.
+pub(crate) fn clean_thinking_tags(text: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("</think>") {
+            remaining = &remaining[start + end + "</think>".len()..];
+        } else {
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
+/// Best-effort: automatically publish an agent's accumulated text response (kind:9)
+/// to the channel when the agent did not execute `buzz messages send`.
+pub(crate) async fn post_auto_publish_message(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &crate::queue::ThreadTags,
+    mentions: &[String],
+    content: &str,
+) {
+    let thread_ref = if crate::queue::is_direct_reply_enforced() {
+        None
+    } else {
+        thread_tags.root_event_id.as_deref().and_then(|root| {
+            let root_id = nostr::EventId::from_hex(root).ok()?;
+            let parent_id = thread_tags
+                .parent_event_id
+                .as_deref()
+                .and_then(|p| nostr::EventId::from_hex(p).ok())
+                .unwrap_or(root_id);
+            Some(buzz_sdk::ThreadRef {
+                root_event_id: root_id,
+                parent_event_id: parent_id,
+            })
+        })
+    };
+    let mention_refs: Vec<&str> = mentions.iter().map(|s| s.as_str()).collect();
+    let builder = match buzz_sdk::build_message(
+        channel_id,
+        content,
+        thread_ref.as_ref(),
+        &mention_refs,
+        false,
+        &[],
+        &[],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "auto-publish: build failed: {e}");
+            return;
+        }
+    };
+    let event = match builder.sign_with_keys(&rest.keys) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "auto-publish: sign failed: {e}");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                channel = %channel_id,
+                event_id = %event.id.to_hex(),
+                "auto-published agent text response to channel"
+            );
+        }
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "auto-publish failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "auto-publish timed out"),
+    }
+}
+
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
@@ -5401,6 +5545,39 @@ mod tests {
             &session_new,
             PermissionMode::Auto.as_wire_str()
         ));
+    }
+
+    #[test]
+    fn resolve_permission_mode_wire_codex_full_access() {
+        let session_new = json!({
+            "modes": { "availableModes": [{ "id": "agent" }, { "id": "agent-full-access" }] }
+        });
+        assert_eq!(
+            resolve_permission_mode_wire(&session_new, &PermissionMode::BypassPermissions),
+            Some("agent-full-access")
+        );
+    }
+
+    #[test]
+    fn resolve_permission_mode_wire_standard_bypass() {
+        let session_new = json!({
+            "modes": { "availableModes": [{ "id": "bypassPermissions" }] }
+        });
+        assert_eq!(
+            resolve_permission_mode_wire(&session_new, &PermissionMode::BypassPermissions),
+            Some("bypassPermissions")
+        );
+    }
+
+    #[test]
+    fn resolve_permission_mode_wire_unsupported_none() {
+        let session_new = json!({
+            "modes": { "availableModes": [{ "id": "read-only" }] }
+        });
+        assert_eq!(
+            resolve_permission_mode_wire(&session_new, &PermissionMode::BypassPermissions),
+            None
+        );
     }
 
     #[test]
@@ -11212,5 +11389,33 @@ done"#
             cap["configOptions"].is_null(),
             "an optionless switch caches the target's (empty) options, never the pre-switch model-a options with a patched effort"
         );
+    }
+
+    #[test]
+    fn test_clean_thinking_tags() {
+        assert_eq!(clean_thinking_tags("hello world"), "hello world");
+        assert_eq!(clean_thinking_tags("<think>some internal thought</think>hello world"), "hello world");
+        assert_eq!(clean_thinking_tags("<think>thought 1</think>hello <think>thought 2</think>world"), "hello world");
+        assert_eq!(clean_thinking_tags("<think>unclosed thought"), "");
+    }
+
+    #[test]
+    fn test_is_auto_publish_fallback_enabled() {
+        std::env::remove_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK");
+        assert!(is_auto_publish_fallback_enabled());
+
+        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "false");
+        assert!(!is_auto_publish_fallback_enabled());
+
+        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "off");
+        assert!(!is_auto_publish_fallback_enabled());
+
+        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "0");
+        assert!(!is_auto_publish_fallback_enabled());
+
+        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "true");
+        assert!(is_auto_publish_fallback_enabled());
+
+        std::env::remove_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK");
     }
 }

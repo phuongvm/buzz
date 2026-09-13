@@ -1377,7 +1377,7 @@ pub(crate) fn format_event_block(
 
 /// Append a reply instruction when the agent is responding to a thread event.
 ///
-fn is_direct_reply_enforced() -> bool {
+pub(crate) fn is_direct_reply_enforced() -> bool {
     std::env::var("BUZZ_REPLY_IN_THREAD")
         .map(|v| v == "false" || v == "0")
         .unwrap_or(false)
