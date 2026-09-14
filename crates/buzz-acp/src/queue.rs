@@ -1375,61 +1375,64 @@ pub(crate) fn format_event_block(
     block
 }
 
-/// Append a reply instruction when the agent is responding to a thread event.
-///
-pub(crate) fn is_direct_reply_enforced() -> bool {
-    std::env::var("BUZZ_REPLY_IN_THREAD")
-        .map(|v| v == "false" || v == "0")
-        .unwrap_or(false)
-        || std::env::var("BUZZ_REPLY_TO_MODE")
-            .map(|v| v.eq_ignore_ascii_case("off"))
-            .unwrap_or(false)
-        || std::env::var("BUZZ_DIRECT_REPLIES_ONLY")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-}
-
-/// Tells the agent to default to `--reply-to <event_id>` for ordinary replies
-/// while still allowing an explicit human request to post at the channel root or
-/// top level.
-fn append_reply_instruction(s: &mut String, event_id: &str) {
-    if is_direct_reply_enforced() {
-        s.push_str(
-            "\nIMPORTANT: Direct replies are enforced in this workspace. All replies in this \
-             turn MUST be sent directly to the channel root without `--reply-to` on `buzz messages send`. \
-             Do NOT reply in threads.",
-        );
-    } else {
-        s.push_str(&format!(
-            "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
-             on `buzz messages send` so the conversation stays threaded. \
-             If the human explicitly asks for a channel-root, top-level, \
-             or broadcast post, send that message without `--reply-to`. \
-             If the requested destination is ambiguous, ask before sending."
-        ));
+fn parse_reply_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
     }
 }
 
-/// Append a new-thread reply instruction for a human-facing top-level mention.
-///
-/// The triggering mention has no thread tags, so the agent's reply becomes the
-/// thread root. Anchoring to the triggering event (rather than leaving the
-/// choice open) prevents replying into a stale/unrelated prior thread.
-fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
-    if is_direct_reply_enforced() {
-        s.push_str(
+fn direct_reply_enforced(
+    reply_in_thread: Option<&str>,
+    reply_to_mode: Option<&str>,
+    direct_replies_only: Option<&str>,
+) -> bool {
+    reply_in_thread.and_then(parse_reply_bool) == Some(false)
+        || reply_to_mode.is_some_and(|value| value.trim().eq_ignore_ascii_case("off"))
+        || direct_replies_only.and_then(parse_reply_bool) == Some(true)
+}
+
+/// Whether workspace settings require unthreaded replies for every turn.
+pub(crate) fn is_direct_reply_enforced() -> bool {
+    direct_reply_enforced(
+        std::env::var("BUZZ_REPLY_IN_THREAD").ok().as_deref(),
+        std::env::var("BUZZ_REPLY_TO_MODE").ok().as_deref(),
+        std::env::var("BUZZ_DIRECT_REPLIES_ONLY").ok().as_deref(),
+    )
+}
+
+/// Append the direct-reply override or the ordinary human-facing reply anchor.
+fn append_reply_instruction(
+    output: &mut String,
+    reply_anchor: Option<&str>,
+    new_thread: bool,
+    direct: bool,
+) {
+    if direct {
+        output.push_str(
             "\nIMPORTANT: Direct replies are enforced in this workspace. All replies in this \
              turn MUST be sent directly to the channel root without `--reply-to` on `buzz messages send`. \
              Do NOT reply in threads.",
         );
-    } else {
-        s.push_str(&format!(
-            "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
-             this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
-             triggering message is the thread root. Do NOT reply into any other \
-             (older) thread. If the human explicitly asks for a channel-root, \
-             top-level, or broadcast post, send that message without `--reply-to`."
-        ));
+    } else if let Some(event_id) = reply_anchor {
+        if new_thread {
+            output.push_str(&format!(
+                "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
+                 this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
+                 triggering message is the thread root. Do NOT reply into any other \
+                 (older) thread. If the human explicitly asks for a channel-root, \
+                 top-level, or broadcast post, send that message without `--reply-to`."
+            ));
+        } else {
+            output.push_str(&format!(
+                "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
+                 on `buzz messages send` so the conversation stays threaded. \
+                 If the human explicitly asks for a channel-root, top-level, \
+                 or broadcast post, send that message without `--reply-to`. \
+                 If the requested destination is ambiguous, ask before sending."
+            ));
+        }
     }
 }
 
@@ -1483,6 +1486,55 @@ fn resolve_reply_anchor(
             .clone()
             .unwrap_or_else(|| triggering_event_id.to_string()),
     )
+}
+
+fn resolve_turn_reply_anchor(
+    event: &Event,
+    thread_tags: &ThreadTags,
+    is_dm: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<String> {
+    if is_dm {
+        thread_tags
+            .root_event_id
+            .is_some()
+            .then(|| event.id.to_hex())
+    } else {
+        resolve_reply_anchor(
+            &event.pubkey.to_hex(),
+            thread_tags,
+            &event.id.to_hex(),
+            profile_lookup,
+        )
+    }
+}
+
+/// Resolve outgoing fallback ancestry using the prompt's reply destination policy.
+///
+/// Direct replies have no thread links. Human-facing channel replies attach to
+/// the root; agent-only replies attach to the trigger within its existing root.
+/// DMs remain top-level unless the trigger is threaded. Mentions are preserved.
+pub fn fallback_thread_tags(
+    event: &Event,
+    is_dm: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+    direct: bool,
+) -> ThreadTags {
+    let mut thread_tags = parse_thread_tags(event);
+    let parent = if direct {
+        None
+    } else {
+        resolve_turn_reply_anchor(event, &thread_tags, is_dm, profile_lookup)
+            .or_else(|| (!is_dm).then(|| event.id.to_hex()))
+    };
+    thread_tags.root_event_id = parent.as_ref().map(|parent| {
+        thread_tags
+            .root_event_id
+            .clone()
+            .unwrap_or_else(|| parent.clone())
+    });
+    thread_tags.parent_event_id = parent;
+    thread_tags
 }
 
 /// Maximum length (in characters) of a channel description rendered into `<context>`.
@@ -1638,6 +1690,7 @@ fn format_context_hints(
     is_dm: bool,
     conversation_context_status: ConversationContextStatus,
     reply_anchor: Option<&str>,
+    direct: bool,
 ) -> String {
     let channel_id = scope.channel_id();
     let channel_display = match channel_info {
@@ -1655,7 +1708,7 @@ fn format_context_hints(
 
     // DM check comes first — a DM reply has both thread tags AND is_dm=true,
     // and the scope should be "dm" (not "thread") because the agent is in a DM.
-    if is_dm {
+    let mut hints = if is_dm {
         let is_reply = thread_tags.root_event_id.is_some();
         // DM replies use thread command because /messages excludes thread replies.
         // DM non-replies use get for recent conversation.
@@ -1690,11 +1743,8 @@ fn format_context_hints(
                     s.push_str(&format!("\nParent: {parent}"));
                 }
             }
-            if let Some(event_id) = reply_anchor {
-                append_reply_instruction(&mut s, event_id);
-            }
         }
-        crate::prompt_framing::semantic_section("context", &s)
+        s
     } else if let Some(root) = scope
         .root_event_id()
         .or(thread_tags.root_event_id.as_deref())
@@ -1727,14 +1777,7 @@ fn format_context_hints(
             }
         }
         s.push_str(&format!("\n{ctx_hint}"));
-        if let Some(event_id) = reply_anchor {
-            if thread_tags.root_event_id.is_some() {
-                append_reply_instruction(&mut s, event_id);
-            } else {
-                append_new_thread_reply_instruction(&mut s, event_id);
-            }
-        }
-        crate::prompt_framing::semantic_section("context", &s)
+        s
     } else {
         let mut s = format!(
             "Scope: channel\n\
@@ -1746,11 +1789,15 @@ fn format_context_hints(
         s.push_str(
             "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
         );
-        if let Some(event_id) = reply_anchor {
-            append_new_thread_reply_instruction(&mut s, event_id);
-        }
-        crate::prompt_framing::semantic_section("context", &s)
-    }
+        s
+    };
+    append_reply_instruction(
+        &mut hints,
+        reply_anchor,
+        thread_tags.root_event_id.is_none(),
+        direct,
+    );
+    crate::prompt_framing::semantic_section("context", &hints)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2062,20 +2109,8 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //   - top-level     → anchor to the triggering event (it becomes the root)
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs are always 1:1 with a human, so they always anchor.
-    let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| last_event.event.id.to_hex())
-    } else {
-        resolve_reply_anchor(
-            &sender_pubkey,
-            &thread_tags,
-            &last_event.event.id.to_hex(),
-            args.profile_lookup,
-        )
-    };
+    let reply_anchor =
+        resolve_turn_reply_anchor(&last_event.event, &thread_tags, is_dm, args.profile_lookup);
     sections.push(format_context_hints(
         &batch.scope,
         args.channel_info,
@@ -2087,6 +2122,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context_had_delivered_events,
         ),
         reply_anchor.as_deref(),
+        is_direct_reply_enforced(),
     ));
 
     // 3. Conversation context (thread or DM).
@@ -5566,21 +5602,155 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_reply_enforced_instruction() {
-        let mut s = String::new();
-        // Without env, regular instruction is appended
-        append_reply_instruction(&mut s, "abc");
-        assert!(s.contains("--reply-to abc"));
+    fn test_direct_reply_boolean_parser() {
+        for (value, expected) in [
+            ("true", Some(true)),
+            ("1", Some(true)),
+            (" TRUE ", Some(true)),
+            ("false", Some(false)),
+            ("0", Some(false)),
+            (" False ", Some(false)),
+            ("", None),
+            ("invalid", None),
+        ] {
+            assert_eq!(parse_reply_bool(value), expected, "{value:?}");
+        }
+    }
 
-        // With BUZZ_REPLY_IN_THREAD=false, direct reply directive is appended
-        std::env::set_var("BUZZ_REPLY_IN_THREAD", "false");
-        let mut s_direct = String::new();
-        append_reply_instruction(&mut s_direct, "abc");
-        assert!(s_direct.contains("Direct replies are enforced"));
-        assert!(!s_direct.contains("--reply-to abc"));
+    #[test]
+    fn test_direct_reply_settings_precedence() {
+        for (thread_setting, thread_forces_direct) in [
+            (None, false),
+            (Some("false"), true),
+            (Some(" 0 "), true),
+            (Some("FALSE"), true),
+            (Some("true"), false),
+            (Some("1"), false),
+            (Some("invalid"), false),
+        ] {
+            for (mode, mode_forces_direct) in [
+                (None, false),
+                (Some("off"), true),
+                (Some(" OFF "), true),
+                (Some("on"), false),
+                (Some("invalid"), false),
+            ] {
+                for (direct_setting, direct_forces_direct) in [
+                    (None, false),
+                    (Some("true"), true),
+                    (Some(" 1 "), true),
+                    (Some("TRUE"), true),
+                    (Some("false"), false),
+                    (Some("0"), false),
+                    (Some("invalid"), false),
+                ] {
+                    assert_eq!(
+                        direct_reply_enforced(thread_setting, mode, direct_setting),
+                        thread_forces_direct || mode_forces_direct || direct_forces_direct,
+                        "{thread_setting:?}, {mode:?}, {direct_setting:?}"
+                    );
+                }
+            }
+        }
+    }
 
-        // Cleanup
-        std::env::remove_var("BUZZ_REPLY_IN_THREAD");
+    #[test]
+    fn test_direct_reply_instruction_all_turn_scopes() {
+        let channel_id = Uuid::new_v4();
+        for is_dm in [false, true] {
+            for is_thread_session in [false, true] {
+                for root in [None, Some(ROOT_ID)] {
+                    for human_facing in [false, true] {
+                        let scope = if is_thread_session {
+                            thread(channel_id, ROOT_ID)
+                        } else {
+                            conv(channel_id)
+                        };
+                        let tags = thread_tags(root, &[]);
+                        let anchor = if is_dm {
+                            root.map(|_| TRIGGER_ID)
+                        } else if human_facing {
+                            Some(root.unwrap_or(TRIGGER_ID))
+                        } else {
+                            None
+                        };
+                        for direct in [false, true] {
+                            let hints = format_context_hints(
+                                &scope,
+                                None,
+                                &tags,
+                                is_dm,
+                                ConversationContextStatus::Absent,
+                                anchor,
+                                direct,
+                            );
+                            assert_eq!(hints.contains("Direct replies are enforced"), direct);
+                            if direct {
+                                assert_eq!(hints.matches("Do NOT reply in threads.").count(), 1);
+                                assert!(!hints.contains(&format!("--reply-to {ROOT_ID}")));
+                                assert!(!hints.contains(&format!("--reply-to {TRIGGER_ID}")));
+                                assert!(!hints.contains("For ordinary replies"));
+                            } else if let Some(anchor) = anchor {
+                                assert!(hints.contains(&format!("--reply-to {anchor}")));
+                                assert_eq!(hints.contains("new top-level message"), root.is_none());
+                            } else {
+                                assert!(!hints.contains("--reply-to"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_fallback_thread_tags_destination_policy() {
+        for ancestry in ["top-level", "root-reply", "deep-reply"] {
+            let mut event_tags = vec![vec!["p".into(), AGENT_B_PK.into()]];
+            if ancestry != "top-level" {
+                event_tags.push(vec!["e".into(), ROOT_ID.into(), "".into(), "root".into()]);
+                let parent = if ancestry == "root-reply" {
+                    ROOT_ID
+                } else {
+                    TRIGGER_ID
+                };
+                event_tags.push(vec!["e".into(), parent.into(), "".into(), "reply".into()]);
+            }
+            let event = make_event_with_tags("trigger", event_tags);
+            let trigger_id = event.id.to_hex();
+            for identity in ["human", "agent-only", "human-mentioned", "unknown"] {
+                let mut profiles = id_lookup();
+                if identity != "unknown" {
+                    profiles.insert(event.pubkey.to_hex(), profile(identity != "human"));
+                }
+                if identity == "human-mentioned" {
+                    profiles.insert(AGENT_B_PK.into(), profile(false));
+                }
+                for is_dm in [false, true] {
+                    for direct in [false, true] {
+                        let tags = fallback_thread_tags(&event, is_dm, Some(&profiles), direct);
+                        let expected = if direct || (is_dm && ancestry == "top-level") {
+                            (None, None)
+                        } else if ancestry == "top-level" {
+                            (Some(trigger_id.as_str()), Some(trigger_id.as_str()))
+                        } else if is_dm || identity == "agent-only" {
+                            (Some(ROOT_ID), Some(trigger_id.as_str()))
+                        } else {
+                            (Some(ROOT_ID), Some(ROOT_ID))
+                        };
+                        assert_eq!(
+                            (
+                                tags.root_event_id.as_deref(),
+                                tags.parent_event_id.as_deref()
+                            ),
+                            expected,
+                            "{ancestry}, {identity}, dm={is_dm}, direct={direct}"
+                        );
+                        assert_eq!(tags.mentioned_pubkeys, vec![AGENT_B_PK]);
+                    }
+                }
+            }
+        }
     }
 
     /// Build a single-event FlushBatch with the given content.

@@ -6,6 +6,8 @@ mod engram_fetch;
 mod filter;
 mod observer;
 mod pi_launcher;
+mod auto_publish;
+mod auto_publish_outbox;
 mod pool;
 mod pool_lifecycle;
 mod prompt_framing;
@@ -2933,6 +2935,32 @@ async fn tokio_main() -> Result<()> {
 
     // ── Step 7: Shutdown signal ───────────────────────────────────────────────
     let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+    let outbox_mode = auto_publish::OutputMode::parse(
+        std::env::var("BUZZ_ACP_OUTPUT_MODE").ok().as_deref(),
+    ).map_err(anyhow::Error::msg)?;
+    let outbox_task = if outbox_mode == auto_publish::OutputMode::ConversationalFinal {
+        let rest = relay_rest_client.clone();
+        let outbox = auto_publish_outbox::Outbox::new(
+            rest.clone(), auto_publish_outbox::default_root(&rest).map_err(anyhow::Error::msg)?,
+        ).map_err(anyhow::Error::msg)?;
+        let mut stopping = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(30));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stopping.changed() => break,
+                    _ = timer.tick() => {
+                        if let Err(error) = outbox.flush().await {
+                            tracing::error!("automatic publication outbox pending: {error}");
+                        }
+                    }
+                }
+            }
+        }))
+    } else { None };
+
 
     let tx = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -4056,6 +4084,12 @@ async fn tokio_main() -> Result<()> {
     // just as promptly. Timeout is a backstop for a slot stuck outside the
     // select (e.g. in spawn); only then do we fall back to aborting.
     let _ = shutdown_tx.send(());
+    if let Some(mut task) = outbox_task {
+        if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
     let wake_drain = tokio::time::timeout(Duration::from_secs(30), async {
         while wake_tasks.join_next().await.is_some() {}
     })

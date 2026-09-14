@@ -214,10 +214,8 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
-    /// Text emitted by the agent during the current prompt turn via `agent_message_chunk`.
-    turn_text: String,
-    /// Whether the agent invoked `buzz messages send` during the current turn.
-    turn_has_published_message: bool,
+    output_mode: crate::auto_publish::OutputMode,
+    turn_output: crate::auto_publish::TurnOutput,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -463,6 +461,9 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
+        let output_mode = crate::auto_publish::OutputMode::parse(
+            std::env::var("BUZZ_ACP_OUTPUT_MODE").ok().as_deref(),
+        ).map_err(AcpError::Protocol)?;
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -512,8 +513,9 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            // Authoritative agent-scoped credentials (BUZZ_*) must always override parent environment.
-            if key.starts_with("BUZZ_") || std::env::var_os(key).is_none() {
+            if matches!(key.as_str(), "BUZZ_PRIVATE_KEY" | "BUZZ_RELAY_URL" | "BUZZ_AUTH_TAG")
+                || std::env::var_os(key).is_none()
+            {
                 cmd.env(key, value);
             }
         }
@@ -568,8 +570,8 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
-            turn_text: String::new(),
-            turn_has_published_message: false,
+            output_mode,
+            turn_output: crate::auto_publish::TurnOutput::default(),
         })
     }
 
@@ -589,14 +591,13 @@ impl AcpClient {
         self.observer.clone()
     }
 
-    /// Take and clear the accumulated agent text for the current turn.
-    pub fn take_turn_text(&mut self) -> String {
-        std::mem::take(&mut self.turn_text)
+    pub(crate) fn begin_publication_turn(&mut self, turn_id: &str) -> Option<String> {
+        self.turn_output = crate::auto_publish::TurnOutput::begin(self.output_mode, turn_id);
+        self.turn_output.instruction()
     }
 
-    /// Whether the agent executed a tool call to send a message during this turn.
-    pub fn turn_has_published_message(&self) -> bool {
-        self.turn_has_published_message
+    pub(crate) fn take_turn_output(&mut self) -> crate::auto_publish::TurnOutput {
+        std::mem::take(&mut self.turn_output)
     }
 
     /// Return the pool slot index for this agent process.
@@ -798,8 +799,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        self.turn_text.clear();
-        self.turn_has_published_message = false;
+        self.turn_output.reset();
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1774,7 +1774,7 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    self.turn_text.push_str(text);
+                    self.turn_output.push_text(text);
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
@@ -1789,15 +1789,11 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
-                let update_str = update.to_string();
-                if update_str.contains("buzz messages send")
-                    || update_str.contains("messages send")
-                {
-                    self.turn_has_published_message = true;
-                }
+                self.turn_output.observe_tool();
                 true
             }
             "tool_call_update" => {
+                self.turn_output.observe_tool();
                 let tool_id = update
                     .get("toolCallId")
                     .and_then(|v| v.as_str())
@@ -3840,70 +3836,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_text_accumulates_and_clears() {
+    async fn publication_capture_binds_message_and_tool_update_paths() {
         let mut client = spawn_inert_client().await;
-        assert_eq!(client.take_turn_text(), "");
-
-        let chunk1 = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "text": "Hello " }
-                }
-            }
-        });
-        let chunk2 = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "text": "world!" }
-                }
-            }
-        });
-
-        let _ = client.handle_session_update(&chunk1);
-        let _ = client.handle_session_update(&chunk2);
-
-        assert_eq!(client.take_turn_text(), "Hello world!");
-        assert_eq!(client.take_turn_text(), "");
+        client.output_mode = crate::auto_publish::OutputMode::ConversationalFinal;
+        assert!(client.begin_publication_turn("fresh").is_some());
+        let update = serde_json::json!({"params":{"update":{
+            "sessionUpdate":"agent_message_chunk",
+            "content":{"text":"[[BUZZ_FINAL:fresh]]hello[[/BUZZ_FINAL:fresh]]"}
+        }}});
+        client.handle_session_update(&update);
+        assert_eq!(client.take_turn_output().final_text(), Ok(Some("hello".into())));
+        client.begin_publication_turn("fresh");
+        client.handle_session_update(&update);
+        client.handle_session_update(&serde_json::json!({"params":{"update":{
+            "sessionUpdate":"tool_call_update", "toolCallId":"script", "status":"completed"
+        }}}));
+        assert!(client.take_turn_output().final_text().is_err());
+        client.shutdown().await;
     }
 
     #[tokio::test]
-    async fn tool_call_detects_messages_send() {
+    async fn publication_capture_does_not_guess_success_from_help_or_command_text() {
         let mut client = spawn_inert_client().await;
-        assert!(!client.turn_has_published_message());
-
-        let ordinary_tool = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "title": "bash",
-                    "rawInput": { "command": "pwd && ls" }
-                }
-            }
-        });
-        let _ = client.handle_session_update(&ordinary_tool);
-        assert!(!client.turn_has_published_message());
-
-        let send_tool = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "title": "bash",
-                    "rawInput": { "command": "printf 'hi' | buzz messages send --channel abc --content -" }
-                }
-            }
-        });
-        let _ = client.handle_session_update(&send_tool);
-        assert!(client.turn_has_published_message());
+        client.output_mode = crate::auto_publish::OutputMode::ConversationalFinal;
+        for command in ["buzz messages send --help", "bash reply.sh", "buzz messages  send --content hi"] {
+            client.begin_publication_turn("fresh");
+            client.handle_session_update(&serde_json::json!({"params":{"update":{
+                "sessionUpdate":"agent_message_chunk",
+                "content":{"text":"[[BUZZ_FINAL:fresh]]hello[[/BUZZ_FINAL:fresh]]"}
+            }}}));
+            client.handle_session_update(&serde_json::json!({"params":{"update":{
+                "sessionUpdate":"tool_call", "title":"bash", "rawInput":{"command":command}
+            }}}));
+            assert!(client.take_turn_output().final_text().is_err(), "{command}");
+        }
+        client.shutdown().await;
     }
 
     // ── Goose-native steer arm tests ──────────────────────────────────────

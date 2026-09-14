@@ -2831,7 +2831,8 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
-    let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+    let mut publication_thread_tags = crate::queue::ThreadTags::default();
+    let mut prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
@@ -2892,6 +2893,14 @@ pub async fn run_prompt_task(
 
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+        if let Some(trigger) = b.events.last() {
+            publication_thread_tags = crate::queue::fallback_thread_tags(
+                &trigger.event,
+                channel_info.as_ref().is_some_and(|info| info.channel_type == "dm"),
+                profile_lookup.as_ref(),
+                crate::queue::is_direct_reply_enforced(),
+            );
+        }
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -2940,6 +2949,12 @@ pub async fn run_prompt_task(
         );
         return;
     };
+
+    if matches!(source, PromptSource::Channel(_)) {
+        if let Some(instruction) = agent.acp.begin_publication_turn(&turn_id) {
+            prompt_sections.push(instruction);
+        }
+    }
 
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
@@ -3156,6 +3171,10 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        let publication = finalize_auto_publish(
+                            &mut agent, &ctx, batch.as_ref(), &publication_thread_tags,
+                            &turn_id, &StopReason::EndTurn,
+                        ).await;
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -3163,7 +3182,11 @@ pub async fn run_prompt_task(
                             observer_channel_id,
                             &session_id,
                             &turn_id,
-                            Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+                            Some(if publication.is_ok() {
+                                buzz_core::agent_turn_metric::StopReason::EndTurn
+                            } else {
+                                buzz_core::agent_turn_metric::StopReason::Error
+                            }),
                         )
                         .await;
                         send_prompt_result(
@@ -3171,7 +3194,8 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
-                            PromptOutcome::Ok(StopReason::EndTurn),
+                            publication.map(|()| PromptOutcome::Ok(StopReason::EndTurn))
+                                .unwrap_or_else(PromptOutcome::Error),
                             None, // turn succeeded — batch was processed, no requeue
                         );
                         return;
@@ -3194,48 +3218,14 @@ pub async fn run_prompt_task(
                     &pending_delivered_event_ids,
                 );
 
-                let turn_text = agent.acp.take_turn_text();
-                let has_published = agent.acp.turn_has_published_message();
-
-                if matches!(stop_reason, StopReason::EndTurn)
-                    && !has_published
-                    && is_auto_publish_fallback_enabled()
-                {
-                    if let Some(ref b) = batch {
-                        let clean_text = clean_thinking_tags(&turn_text);
-                        let trimmed = clean_text.trim();
-                        if !trimmed.is_empty() {
-                            tracing::info!(
-                                channel = %scope.channel_id(),
-                                text_len = trimmed.len(),
-                                "auto-publishing agent text response fallback to channel"
-                            );
-                            let thread_tags = b
-                                .events
-                                .last()
-                                .map(|e| crate::queue::parse_thread_tags(&e.event))
-                                .unwrap_or_default();
-                            let mentions: Vec<String> = b
-                                .events
-                                .last()
-                                .filter(|e| e.event.pubkey != ctx.agent_keys.public_key())
-                                .map(|e| vec![e.event.pubkey.to_hex()])
-                                .unwrap_or_default();
-
-                            post_auto_publish_message(
-                                &ctx.rest_client,
-                                scope.channel_id(),
-                                &thread_tags,
-                                &mentions,
-                                trimmed,
-                            )
-                            .await;
-                        }
-                    }
-                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
+
+            let publication = finalize_auto_publish(
+                &mut agent, &ctx, batch.as_ref(), &publication_thread_tags,
+                &turn_id, &stop_reason,
+            ).await;
 
             let should_rotate = matches!(
                 stop_reason,
@@ -3269,7 +3259,11 @@ pub async fn run_prompt_task(
                 agent.state.invalidate(&source);
             }
 
-            let core_stop = acp_stop_to_core(&stop_reason);
+            let core_stop = if publication.is_ok() {
+                acp_stop_to_core(&stop_reason)
+            } else {
+                buzz_core::agent_turn_metric::StopReason::Error
+            };
             let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
                 &ctx,
@@ -3286,7 +3280,8 @@ pub async fn run_prompt_task(
                 &turn_id,
                 agent,
                 source,
-                PromptOutcome::Ok(stop_reason),
+                publication.map(|()| PromptOutcome::Ok(stop_reason))
+                    .unwrap_or_else(PromptOutcome::Error),
                 None,
             );
         }
@@ -5281,89 +5276,24 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
-/// Check if auto-publish fallback for agent conversational text is enabled.
-pub(crate) fn is_auto_publish_fallback_enabled() -> bool {
-    std::env::var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK")
-        .map(|v| v != "false" && v != "0" && !v.eq_ignore_ascii_case("off"))
-        .unwrap_or(true)
-}
-
-/// Strip <think>...</think> blocks from model output if present.
-pub(crate) fn clean_thinking_tags(text: &str) -> String {
-    let mut result = String::new();
-    let mut remaining = text;
-    while let Some(start) = remaining.find("<think>") {
-        result.push_str(&remaining[..start]);
-        if let Some(end) = remaining[start..].find("</think>") {
-            remaining = &remaining[start + end + "</think>".len()..];
-        } else {
-            remaining = "";
-            break;
-        }
-    }
-    result.push_str(remaining);
-    result
-}
-
-/// Best-effort: automatically publish an agent's accumulated text response (kind:9)
-/// to the channel when the agent did not execute `buzz messages send`.
-pub(crate) async fn post_auto_publish_message(
-    rest: &crate::relay::RestClient,
-    channel_id: Uuid,
+async fn finalize_auto_publish(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    batch: Option<&crate::queue::FlushBatch>,
     thread_tags: &crate::queue::ThreadTags,
-    mentions: &[String],
-    content: &str,
-) {
-    let thread_ref = if crate::queue::is_direct_reply_enforced() {
-        None
-    } else {
-        thread_tags.root_event_id.as_deref().and_then(|root| {
-            let root_id = nostr::EventId::from_hex(root).ok()?;
-            let parent_id = thread_tags
-                .parent_event_id
-                .as_deref()
-                .and_then(|p| nostr::EventId::from_hex(p).ok())
-                .unwrap_or(root_id);
-            Some(buzz_sdk::ThreadRef {
-                root_event_id: root_id,
-                parent_event_id: parent_id,
-            })
-        })
-    };
-    let mention_refs: Vec<&str> = mentions.iter().map(|s| s.as_str()).collect();
-    let builder = match buzz_sdk::build_message(
-        channel_id,
-        content,
-        thread_ref.as_ref(),
-        &mention_refs,
-        false,
-        &[],
-        &[],
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(channel = %channel_id, "auto-publish: build failed: {e}");
-            return;
-        }
-    };
-    let event = match builder.sign_with_keys(&rest.keys) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(channel = %channel_id, "auto-publish: sign failed: {e}");
-            return;
-        }
-    };
-    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-        Ok(Ok(_)) => {
-            tracing::info!(
-                channel = %channel_id,
-                event_id = %event.id.to_hex(),
-                "auto-published agent text response to channel"
-            );
-        }
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "auto-publish failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "auto-publish timed out"),
+    turn_id: &str,
+    stop_reason: &StopReason,
+) -> Result<(), AcpError> {
+    let output = agent.acp.take_turn_output();
+    let result = crate::auto_publish::deliver(
+        output, &ctx.rest_client, batch, thread_tags, turn_id,
+        matches!(stop_reason, StopReason::EndTurn),
+    ).await;
+    if let Err(error) = &result {
+        tracing::error!(turn_id, "automatic publication requires attention: {error}");
+        agent.acp.observe("publication_failed", serde_json::json!({"error": error}));
     }
+    result.map_err(AcpError::Protocol)
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -11391,31 +11321,5 @@ done"#
         );
     }
 
-    #[test]
-    fn test_clean_thinking_tags() {
-        assert_eq!(clean_thinking_tags("hello world"), "hello world");
-        assert_eq!(clean_thinking_tags("<think>some internal thought</think>hello world"), "hello world");
-        assert_eq!(clean_thinking_tags("<think>thought 1</think>hello <think>thought 2</think>world"), "hello world");
-        assert_eq!(clean_thinking_tags("<think>unclosed thought"), "");
-    }
 
-    #[test]
-    fn test_is_auto_publish_fallback_enabled() {
-        std::env::remove_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK");
-        assert!(is_auto_publish_fallback_enabled());
-
-        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "false");
-        assert!(!is_auto_publish_fallback_enabled());
-
-        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "off");
-        assert!(!is_auto_publish_fallback_enabled());
-
-        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "0");
-        assert!(!is_auto_publish_fallback_enabled());
-
-        std::env::set_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK", "true");
-        assert!(is_auto_publish_fallback_enabled());
-
-        std::env::remove_var("BUZZ_ACP_AUTO_PUBLISH_FALLBACK");
-    }
 }

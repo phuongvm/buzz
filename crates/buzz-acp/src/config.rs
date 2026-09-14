@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::ValueEnum;
-use nostr::{Keys, ToBech32};
+use nostr::Keys;
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -1141,9 +1141,7 @@ impl Config {
         // child tools (like hermes terminal) have the correct identity keys.
         persona_env_vars.push((
             "BUZZ_PRIVATE_KEY".to_string(),
-            keys.secret_key()
-                .to_bech32()
-                .expect("secret key bech32 encoding should never fail"),
+            keys.secret_key().to_secret_hex(),
         ));
         persona_env_vars.push(("BUZZ_RELAY_URL".to_string(), args.relay_url.clone()));
         if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
@@ -2968,6 +2966,44 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn forwarded_credentials_preserve_authoritative_identity_and_relay() {
+        use nostr::ToBech32;
+
+        let expected_keys = Keys::parse(TEST_PRIVATE_KEY).unwrap();
+        let nsec = expected_keys.secret_key().to_bech32().unwrap();
+        for private_key in [TEST_PRIVATE_KEY, nsec.as_str()] {
+            let args = CliArgs::try_parse_from([
+                "buzz-acp",
+                "--private-key",
+                private_key,
+                "--relay-url",
+                "wss://relay.example.test",
+            ])
+            .unwrap();
+            let config = Config::from_args(args).unwrap();
+            let forwarded_keys: Vec<_> = config
+                .persona_env_vars
+                .iter()
+                .filter(|(name, _)| name == "BUZZ_PRIVATE_KEY")
+                .map(|(_, value)| value)
+                .collect();
+            assert_eq!(forwarded_keys.len(), 1);
+            assert_eq!(forwarded_keys[0], TEST_PRIVATE_KEY);
+            assert_eq!(
+                Keys::parse(forwarded_keys[0]).unwrap().public_key(),
+                expected_keys.public_key()
+            );
+            let forwarded_relays: Vec<_> = config
+                .persona_env_vars
+                .iter()
+                .filter(|(name, _)| name == "BUZZ_RELAY_URL")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(forwarded_relays, vec!["wss://relay.example.test"]);
+        }
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {
