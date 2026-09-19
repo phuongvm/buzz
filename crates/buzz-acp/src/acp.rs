@@ -2251,6 +2251,7 @@ pub fn resolve_model_switch_method(
             None => continue,
         };
         if let Some(options) = config_opt.get("options").and_then(|v| v.as_array()) {
+            // Prefer exact match first
             for opt in options {
                 if opt.get("value").and_then(|v| v.as_str()) == Some(desired_model) {
                     return Some(ModelSwitchMethod::ConfigOption {
@@ -2259,17 +2260,39 @@ pub fn resolve_model_switch_method(
                     });
                 }
             }
+            // Allow matching prefixed provider models (e.g. "openai/cb-ling-3.0-flash" for "cb-ling-3.0-flash")
+            for opt in options {
+                if let Some(val) = opt.get("value").and_then(|v| v.as_str()) {
+                    if val.ends_with(&format!("/{desired_model}")) {
+                        return Some(ModelSwitchMethod::ConfigOption {
+                            config_id: config_id.to_string(),
+                            option_value: val.to_string(),
+                        });
+                    }
+                }
+            }
         }
     }
 
     // 2. Search unstable availableModels for a matching modelId.
     if let Some(models) = extract_model_state(session_new_result) {
         if let Some(available) = models.get("availableModels").and_then(|v| v.as_array()) {
+            // Prefer exact match first
             for model in available {
                 if model.get("modelId").and_then(|v| v.as_str()) == Some(desired_model) {
                     return Some(ModelSwitchMethod::SetModel {
                         model_id: desired_model.to_string(),
                     });
+                }
+            }
+            // Suffix match for provider-prefixed models
+            for model in available {
+                if let Some(m_id) = model.get("modelId").and_then(|v| v.as_str()) {
+                    if m_id.ends_with(&format!("/{desired_model}")) {
+                        return Some(ModelSwitchMethod::SetModel {
+                            model_id: m_id.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -2297,7 +2320,11 @@ pub fn model_in_catalog(
             .is_some_and(|options| {
                 options
                     .iter()
-                    .any(|opt| opt.get("value").and_then(|v| v.as_str()) == Some(desired_model))
+                    .any(|opt| {
+                        let val = opt.get("value").and_then(|v| v.as_str());
+                        val == Some(desired_model)
+                            || val.is_some_and(|v| v.ends_with(&format!("/{desired_model}")))
+                    })
             })
     });
     if in_config_options {
@@ -2310,7 +2337,11 @@ pub fn model_in_catalog(
         .is_some_and(|available| {
             available
                 .iter()
-                .any(|model| model.get("modelId").and_then(|v| v.as_str()) == Some(desired_model))
+                .any(|model| {
+                    let m_id = model.get("modelId").and_then(|v| v.as_str());
+                    m_id == Some(desired_model)
+                        || m_id.is_some_and(|v| v.ends_with(&format!("/{desired_model}")))
+                })
         })
 }
 
@@ -3019,6 +3050,33 @@ mod tests {
     #[test]
     fn model_in_catalog_false_when_both_halves_empty() {
         assert!(!super::model_in_catalog(&[], None, "anything"));
+    }
+
+    #[test]
+    fn resolve_matches_provider_prefixed_model() {
+        let result = serde_json::json!({
+            "configOptions": [{
+                "configId": "model",
+                "category": "model",
+                "options": [
+                    { "value": "openai/cb-ling-3.0-flash", "name": "OpenAI/cb-ling-3.0-flash" },
+                    { "value": "openai/gpt-4o", "name": "OpenAI/GPT-4o" }
+                ]
+            }]
+        });
+        let method = super::resolve_model_switch_method(&result, "cb-ling-3.0-flash");
+        assert_eq!(
+            method,
+            Some(super::ModelSwitchMethod::ConfigOption {
+                config_id: "model".to_string(),
+                option_value: "openai/cb-ling-3.0-flash".to_string(),
+            })
+        );
+        assert!(super::model_in_catalog(
+            result["configOptions"].as_array().unwrap(),
+            None,
+            "cb-ling-3.0-flash"
+        ));
     }
 
     // ── Error variant display ─────────────────────────────────────────────
