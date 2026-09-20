@@ -2861,7 +2861,7 @@ pub async fn run_prompt_task(
     // failed or cancelled first turn must not make its retry assume that the
     // provider retained any of that thread's context.
     let mut pending_hydrated_thread_roots = HashSet::new();
-    let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+    let mut prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
