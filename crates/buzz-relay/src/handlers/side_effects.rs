@@ -408,7 +408,20 @@ pub async fn validate_admin_event(
                 channel_authz::decide_self_departure(&members, &actor_bytes)?;
                 Ok(())
             } else {
-                match channel_authz::classify_remove_other(&members, &actor_bytes) {
+                // Community-wide authority: a relay owner/admin may remove any
+                // member from any channel, including a DM where every
+                // participant is a plain member. Same principal rule as
+                // `moderation_authz` uses for kick/ban.
+                let relay_role = state
+                    .db
+                    .get_relay_member(tenant.community(), &hex::encode(&actor_bytes))
+                    .await?
+                    .map(|m| m.role);
+                match channel_authz::classify_remove_other(
+                    &members,
+                    &actor_bytes,
+                    relay_role.as_deref(),
+                ) {
                     RemoveOtherDecision::Allow => Ok(()),
                     RemoveOtherDecision::CheckAgentOwner => {
                         if state

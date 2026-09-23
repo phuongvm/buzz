@@ -207,7 +207,22 @@ pub enum RemoveOtherDecision {
 }
 
 /// Classify `actor`'s authority to remove another member (NIP-29 kind:9001).
-pub fn classify_remove_other(members: &[MemberRecord], actor: &[u8]) -> RemoveOtherDecision {
+///
+/// `relay_role` is the actor's community-wide `relay_members` role, if any.
+/// A relay owner or admin already holds community-wide moderation authority
+/// (the rule [`super::moderation_authz`] applies to kick/ban), so the same
+/// principal may remove any member from any channel. This is the only
+/// authority that can exist in a DM: every DM participant is a plain
+/// `member`, so without it a stray identity added to a DM could never be
+/// removed by anyone.
+pub fn classify_remove_other(
+    members: &[MemberRecord],
+    actor: &[u8],
+    relay_role: Option<&str>,
+) -> RemoveOtherDecision {
+    if matches!(relay_role, Some("owner") | Some("admin")) {
+        return RemoveOtherDecision::Allow;
+    }
     match members.iter().find(|m| m.pubkey == actor) {
         Some(m) if m.role == "owner" || m.role == "admin" => RemoveOtherDecision::Allow,
         Some(_) => RemoveOtherDecision::CheckAgentOwner,
@@ -247,8 +262,8 @@ mod tests {
     type SoleOwnerCase<'a> = (Roster<'a>, u8, bool);
     /// `(roster, actor, expected_error)`.
     type DepartureCase<'a> = (Roster<'a>, u8, Option<ChannelAuthzError>);
-    /// `(roster, actor, expected_decision)`.
-    type RemoveOtherCase<'a> = (Roster<'a>, u8, RemoveOtherDecision);
+    /// `(roster, actor, actor_relay_role, expected_decision)`.
+    type RemoveOtherCase<'a> = (Roster<'a>, u8, Option<&'a str>, RemoveOtherDecision);
     /// `(policy, owner_tag, actor, expected_error)`.
     type AddPolicyCase<'a> = (&'a str, Option<u8>, u8, Option<ChannelAuthzError>);
 
@@ -617,25 +632,40 @@ mod tests {
         use RemoveOtherDecision::{Allow, CheckAgentOwner, Deny};
 
         let cases: &[RemoveOtherCase] = &[
-            // Owners and admins may remove anyone.
-            (&[(1, "owner"), (2, "member")], 1, Allow),
-            (&[(1, "owner"), (2, "admin")], 2, Allow),
+            // Channel owners and admins may remove anyone.
+            (&[(1, "owner"), (2, "member")], 1, None, Allow),
+            (&[(1, "owner"), (2, "admin")], 2, None, Allow),
             // A plain member, guest, or bot may only remove an agent they own.
-            (&[(1, "owner"), (2, "member")], 2, CheckAgentOwner),
-            (&[(1, "owner"), (2, "guest")], 2, CheckAgentOwner),
-            (&[(1, "owner"), (2, "bot")], 2, CheckAgentOwner),
+            (&[(1, "owner"), (2, "member")], 2, None, CheckAgentOwner),
+            (&[(1, "owner"), (2, "guest")], 2, None, CheckAgentOwner),
+            (&[(1, "owner"), (2, "bot")], 2, None, CheckAgentOwner),
+            // A plain `member` relay role grants nothing extra.
+            (
+                &[(1, "owner"), (2, "member")],
+                2,
+                Some("member"),
+                CheckAgentOwner,
+            ),
             // Non-members are denied without an agent-owner read: you must be
             // in the channel to remove anyone, even your own bot.
-            (&[(1, "owner")], 9, Deny),
-            (&[], 9, Deny),
+            (&[(1, "owner")], 9, None, Deny),
+            (&[], 9, None, Deny),
+            (&[(1, "owner")], 9, Some("member"), Deny),
+            // Relay owner/admin hold community-wide authority: allowed from a
+            // plain-member seat (the DM case, where nobody is elevated) and
+            // even when not in the channel, matching moderation_authz.
+            (&[(1, "member"), (2, "member")], 1, Some("owner"), Allow),
+            (&[(1, "member"), (2, "member")], 1, Some("admin"), Allow),
+            (&[(1, "member")], 9, Some("owner"), Allow),
+            (&[(1, "member")], 9, Some("admin"), Allow),
         ];
 
-        for (entries, actor, expected) in cases {
+        for (entries, actor, relay_role, expected) in cases {
             let members = roster(entries);
             assert_eq!(
-                classify_remove_other(&members, &pk(*actor)),
+                classify_remove_other(&members, &pk(*actor), *relay_role),
                 *expected,
-                "roster {entries:?} actor {actor}"
+                "roster {entries:?} actor {actor} relay_role {relay_role:?}"
             );
         }
     }
