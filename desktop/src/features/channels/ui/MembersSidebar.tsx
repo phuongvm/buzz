@@ -486,13 +486,17 @@ export function MembersSidebar({
   const canRemoveMember = React.useCallback(
     (member: ChannelMember) => {
       return (
+        // Relay owner/admin: community-wide authority, mirrors the relay's
+        // kind:9001 rule. This is the only path that works in a DM, where
+        // every participant is a plain member.
+        (canModerate && member.pubkey !== currentPubkey) ||
         (selfMember?.role === "admin" && member.pubkey !== currentPubkey) ||
         (selfMember?.role === "owner" && member.role !== "owner") ||
         Boolean(selfMember && isMyBot(member)) ||
         member.pubkey === currentPubkey
       );
     },
-    [currentPubkey, isMyBot, selfMember],
+    [canModerate, currentPubkey, isMyBot, selfMember],
   );
   const removableManagedBots = React.useMemo(
     () =>
