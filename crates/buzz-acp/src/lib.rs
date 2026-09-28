@@ -5,13 +5,13 @@ mod git;
 mod git_runtime_tests;
 
 mod acp;
+mod auto_publish;
+mod auto_publish_outbox;
 mod config;
 mod engram_fetch;
 mod filter;
 mod isolated_execution;
 mod observer;
-mod auto_publish;
-mod auto_publish_outbox;
 mod pool;
 mod pool_lifecycle;
 mod prompt_framing;
@@ -2944,14 +2944,16 @@ async fn run_harness(
     // ── Step 7: Auto-publish outbox (fork INV-ACP-01/02) ─────────────────────
     // Subscribes to the single `shutdown_tx` owned by `run` (upstream hoisted
     // signal handling ahead of `run_harness`); never create a second channel.
-    let outbox_mode = auto_publish::OutputMode::parse(
-        std::env::var("BUZZ_ACP_OUTPUT_MODE").ok().as_deref(),
-    ).map_err(anyhow::Error::msg)?;
+    let outbox_mode =
+        auto_publish::OutputMode::parse(std::env::var("BUZZ_ACP_OUTPUT_MODE").ok().as_deref())
+            .map_err(anyhow::Error::msg)?;
     let outbox_task = if outbox_mode == auto_publish::OutputMode::ConversationalFinal {
         let rest = relay_rest_client.clone();
         let outbox = auto_publish_outbox::Outbox::new(
-            rest.clone(), auto_publish_outbox::default_root(&rest).map_err(anyhow::Error::msg)?,
-        ).map_err(anyhow::Error::msg)?;
+            rest.clone(),
+            auto_publish_outbox::default_root(&rest).map_err(anyhow::Error::msg)?,
+        )
+        .map_err(anyhow::Error::msg)?;
         let mut stopping = shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(30));
@@ -2968,7 +2970,9 @@ async fn run_harness(
                 }
             }
         }))
-    } else { None };
+    } else {
+        None
+    };
 
     // Startup is complete; the main loop now owns graceful shutdown.
     let _ = startup_ready.send(());
@@ -4079,7 +4083,10 @@ async fn run_harness(
     // select (e.g. in spawn); only then do we fall back to aborting.
     let _ = shutdown_tx.send(());
     if let Some(mut task) = outbox_task {
-        if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+        if tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
             task.abort();
             let _ = task.await;
         }

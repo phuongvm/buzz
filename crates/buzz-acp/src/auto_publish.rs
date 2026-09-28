@@ -30,7 +30,8 @@ pub(crate) struct TurnOutput {
 
 impl fmt::Debug for TurnOutput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("TurnOutput")
+        formatter
+            .debug_struct("TurnOutput")
             .field("turn_id", &self.turn_id)
             .field("bytes", &self.text.len())
             .field("saw_tool", &self.saw_tool)
@@ -60,22 +61,32 @@ impl TurnOutput {
     }
 
     pub(crate) fn push_text(&mut self, text: &str) {
-        if self.turn_id.is_none() || self.overflowed { return; }
+        if self.turn_id.is_none() || self.overflowed {
+            return;
+        }
         let remaining = MAX_CAPTURE_BYTES.saturating_sub(self.text.len());
         let mut boundary = remaining.min(text.len());
-        while !text.is_char_boundary(boundary) { boundary -= 1; }
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
         self.text.push_str(&text[..boundary]);
         self.overflowed = boundary < text.len();
     }
 
     pub(crate) fn observe_tool(&mut self) {
-        if self.turn_id.is_some() { self.saw_tool = true; }
+        if self.turn_id.is_some() {
+            self.saw_tool = true;
+        }
     }
 
-    pub(crate) fn captured_text(&self) -> &str { &self.text }
+    pub(crate) fn captured_text(&self) -> &str {
+        &self.text
+    }
 
     pub(crate) fn final_text(&self) -> Result<Option<String>, String> {
-        let Some(turn_id) = &self.turn_id else { return Ok(None); };
+        let Some(turn_id) = &self.turn_id else {
+            return Ok(None);
+        };
         if self.saw_tool {
             return Err("automatic publication deferred: this conversational turn used tools; publication ownership cannot be proven".into());
         }
@@ -85,24 +96,37 @@ impl TurnOutput {
         let opening = format!("[[BUZZ_FINAL:{turn_id}]]");
         let closing = format!("[[/BUZZ_FINAL:{turn_id}]]");
         if self.text.matches(&opening).count() != 1 || self.text.matches(&closing).count() != 1 {
-            return Err("automatic publication deferred: missing or repeated final response envelope".into());
+            return Err(
+                "automatic publication deferred: missing or repeated final response envelope"
+                    .into(),
+            );
         }
         let start = self.text.find(&opening).ok_or("missing final envelope")? + opening.len();
-        let end = self.text.find(&closing).ok_or("missing final envelope terminator")?;
-        if end < start { return Err("automatic publication deferred: reversed final envelope".into()); }
+        let end = self
+            .text
+            .find(&closing)
+            .ok_or("missing final envelope terminator")?;
+        if end < start {
+            return Err("automatic publication deferred: reversed final envelope".into());
+        }
         let content = self.text[start..end].trim();
         if content.is_empty() || content.len() > MAX_MESSAGE_BYTES {
-            return Err("automatic publication deferred: final response must contain 1..65536 UTF-8 bytes".into());
+            return Err(
+                "automatic publication deferred: final response must contain 1..65536 UTF-8 bytes"
+                    .into(),
+            );
         }
         let normalized = content.to_ascii_lowercase();
-        if normalized.contains("<think") || normalized.contains("</think")
-            || content.contains("[[BUZZ_FINAL:") || content.contains("[[/BUZZ_FINAL:") {
+        if normalized.contains("<think")
+            || normalized.contains("</think")
+            || content.contains("[[BUZZ_FINAL:")
+            || content.contains("[[/BUZZ_FINAL:")
+        {
             return Err("automatic publication deferred: final response contains thought markup or nested envelopes".into());
         }
         Ok(Some(content.to_owned()))
     }
 }
-
 
 pub(crate) async fn deliver(
     output: TurnOutput,
@@ -112,7 +136,9 @@ pub(crate) async fn deliver(
     turn_id: &str,
     ended: bool,
 ) -> Result<(), String> {
-    if output.turn_id.is_none() { return Ok(()); }
+    if output.turn_id.is_none() {
+        return Ok(());
+    }
     let root = crate::auto_publish_outbox::default_root(rest)?;
     let outbox = crate::auto_publish_outbox::Outbox::new(rest.clone(), root)?;
     let final_text = if ended {
@@ -130,20 +156,37 @@ pub(crate) async fn deliver(
     };
     let build_result = (|| {
         let batch = batch.ok_or("automatic publication has no triggering batch")?;
-        let trigger = batch.events.last().ok_or("automatic publication has no triggering event")?;
+        let trigger = batch
+            .events
+            .last()
+            .ok_or("automatic publication has no triggering event")?;
         let thread_ref = match (&thread_tags.root_event_id, &thread_tags.parent_event_id) {
             (Some(root), Some(parent)) => Some(buzz_sdk::ThreadRef {
                 root_event_id: nostr::EventId::from_hex(root).map_err(|error| error.to_string())?,
-                parent_event_id: nostr::EventId::from_hex(parent).map_err(|error| error.to_string())?,
+                parent_event_id: nostr::EventId::from_hex(parent)
+                    .map_err(|error| error.to_string())?,
             }),
             (None, None) => None,
             _ => return Err("automatic publication has incomplete reply destination".to_owned()),
         };
         let author = trigger.event.pubkey.to_hex();
-        let mentions = if trigger.event.pubkey == rest.keys.public_key() { vec![] } else { vec![author.as_str()] };
-        buzz_sdk::build_message(batch.channel_id, &content, thread_ref.as_ref(), &mentions, false, &[], &[])
-            .map_err(|error| error.to_string())?
-            .sign_with_keys(&rest.keys).map_err(|error| error.to_string())
+        let mentions = if trigger.event.pubkey == rest.keys.public_key() {
+            vec![]
+        } else {
+            vec![author.as_str()]
+        };
+        buzz_sdk::build_message(
+            batch.channel_id,
+            &content,
+            thread_ref.as_ref(),
+            &mentions,
+            false,
+            &[],
+            &[],
+        )
+        .map_err(|error| error.to_string())?
+        .sign_with_keys(&rest.keys)
+        .map_err(|error| error.to_string())
     })();
     let event = match build_result {
         Ok(event) => event,
@@ -196,7 +239,12 @@ mod tests {
 
     #[test]
     fn rejects_thought_markup_instead_of_leaking_nested_tail() {
-        for body in ["<think>outer<think>inner</think>SECRET</think>public", "<THINK>secret</THINK>", "<think>unclosed", "<think >secret</think >"] {
+        for body in [
+            "<think>outer<think>inner</think>SECRET</think>public",
+            "<THINK>secret</THINK>",
+            "<think>unclosed",
+            "<think >secret</think >",
+        ] {
             let output = capture(&format!("[[BUZZ_FINAL:fresh]]{body}[[/BUZZ_FINAL:fresh]]"));
             assert!(output.final_text().is_err());
         }
@@ -212,8 +260,16 @@ mod tests {
     #[test]
     fn enforces_utf8_byte_limits_without_panicking() {
         let exactly = "a".repeat(MAX_MESSAGE_BYTES);
-        assert!(capture(&format!("[[BUZZ_FINAL:fresh]]{exactly}[[/BUZZ_FINAL:fresh]]")).final_text().is_ok());
-        assert!(capture(&format!("[[BUZZ_FINAL:fresh]]{exactly}é[[/BUZZ_FINAL:fresh]]")).final_text().is_err());
+        assert!(capture(&format!(
+            "[[BUZZ_FINAL:fresh]]{exactly}[[/BUZZ_FINAL:fresh]]"
+        ))
+        .final_text()
+        .is_ok());
+        assert!(capture(&format!(
+            "[[BUZZ_FINAL:fresh]]{exactly}é[[/BUZZ_FINAL:fresh]]"
+        ))
+        .final_text()
+        .is_err());
         let mut output = capture(&"a".repeat(MAX_CAPTURE_BYTES - 1));
         output.push_text("🐝");
         assert_eq!(output.captured_text().len(), MAX_CAPTURE_BYTES - 1);

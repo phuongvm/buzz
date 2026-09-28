@@ -748,7 +748,8 @@ fn read_json_store<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("failed to read {name}: {e}"))?;
-    serde_json::from_str(crate::util::trim_bom(&content)).map_err(|e| format!("failed to parse {name}: {e}"))
+    serde_json::from_str(crate::util::trim_bom(&content))
+        .map_err(|e| format!("failed to parse {name}: {e}"))
 }
 
 /// Test-accessible alias for `read_json_store`, used by the `pending` module's

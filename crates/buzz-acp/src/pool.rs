@@ -3014,7 +3014,9 @@ pub async fn run_prompt_task(
         if let Some(trigger) = b.events.last() {
             publication_thread_tags = crate::queue::fallback_thread_tags(
                 &trigger.event,
-                channel_info.as_ref().is_some_and(|info| info.channel_type == "dm"),
+                channel_info
+                    .as_ref()
+                    .is_some_and(|info| info.channel_type == "dm"),
                 profile_lookup.as_ref(),
                 crate::queue::is_direct_reply_enforced(),
             );
@@ -3337,15 +3339,19 @@ pub async fn run_prompt_task(
                     &pending_delivered_event_ids,
                     &pending_hydrated_thread_roots,
                 );
-
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
 
             let publication = finalize_auto_publish(
-                &mut agent, &ctx, batch.as_ref(), &publication_thread_tags,
-                &turn_id, &stop_reason,
-            ).await;
+                &mut agent,
+                &ctx,
+                batch.as_ref(),
+                &publication_thread_tags,
+                &turn_id,
+                &stop_reason,
+            )
+            .await;
 
             let should_rotate = matches!(
                 stop_reason,
@@ -3400,7 +3406,8 @@ pub async fn run_prompt_task(
                 &turn_id,
                 agent,
                 source,
-                publication.map(|()| PromptOutcome::Ok(stop_reason))
+                publication
+                    .map(|()| PromptOutcome::Ok(stop_reason))
                     .unwrap_or_else(PromptOutcome::Error),
                 None,
             );
@@ -5497,12 +5504,19 @@ async fn finalize_auto_publish(
 ) -> Result<(), AcpError> {
     let output = agent.acp.take_turn_output();
     let result = crate::auto_publish::deliver(
-        output, &ctx.rest_client, batch, thread_tags, turn_id,
+        output,
+        &ctx.rest_client,
+        batch,
+        thread_tags,
+        turn_id,
         matches!(stop_reason, StopReason::EndTurn),
-    ).await;
+    )
+    .await;
     if let Err(error) = &result {
         tracing::error!(turn_id, "automatic publication requires attention: {error}");
-        agent.acp.observe("publication_failed", serde_json::json!({"error": error}));
+        agent
+            .acp
+            .observe("publication_failed", serde_json::json!({"error": error}));
     }
     result.map_err(AcpError::Protocol)
 }
@@ -12084,8 +12098,6 @@ done"#
             "an optionless switch caches the target's (empty) options, never the pre-switch model-a options with a patched effort"
         );
     }
-
-
 }
 
 #[cfg(all(test, unix))]

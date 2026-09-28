@@ -478,7 +478,8 @@ impl AcpClient {
 
         let output_mode = crate::auto_publish::OutputMode::parse(
             std::env::var("BUZZ_ACP_OUTPUT_MODE").ok().as_deref(),
-        ).map_err(AcpError::Protocol)?;
+        )
+        .map_err(AcpError::Protocol)?;
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args);
         if crate::config::normalize_agent_command_identity(command) == BUZZ_PI_ACP_NAME {
@@ -537,8 +538,10 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if matches!(key.as_str(), "BUZZ_PRIVATE_KEY" | "BUZZ_RELAY_URL" | "BUZZ_AUTH_TAG")
-                || std::env::var_os(key).is_none()
+            if matches!(
+                key.as_str(),
+                "BUZZ_PRIVATE_KEY" | "BUZZ_RELAY_URL" | "BUZZ_AUTH_TAG"
+            ) || std::env::var_os(key).is_none()
             {
                 cmd.env(key, value);
             }
@@ -2376,13 +2379,11 @@ pub fn model_in_catalog(
             .get("options")
             .and_then(|v| v.as_array())
             .is_some_and(|options| {
-                options
-                    .iter()
-                    .any(|opt| {
-                        let val = opt.get("value").and_then(|v| v.as_str());
-                        val == Some(desired_model)
-                            || val.is_some_and(|v| v.ends_with(&format!("/{desired_model}")))
-                    })
+                options.iter().any(|opt| {
+                    let val = opt.get("value").and_then(|v| v.as_str());
+                    val == Some(desired_model)
+                        || val.is_some_and(|v| v.ends_with(&format!("/{desired_model}")))
+                })
             })
     });
     if in_config_options {
@@ -2393,13 +2394,11 @@ pub fn model_in_catalog(
         .and_then(|models| models.get("availableModels"))
         .and_then(|v| v.as_array())
         .is_some_and(|available| {
-            available
-                .iter()
-                .any(|model| {
-                    let m_id = model.get("modelId").and_then(|v| v.as_str());
-                    m_id == Some(desired_model)
-                        || m_id.is_some_and(|v| v.ends_with(&format!("/{desired_model}")))
-                })
+            available.iter().any(|model| {
+                let m_id = model.get("modelId").and_then(|v| v.as_str());
+                m_id == Some(desired_model)
+                    || m_id.is_some_and(|v| v.ends_with(&format!("/{desired_model}")))
+            })
         })
 }
 
@@ -3845,7 +3844,10 @@ mod tests {
             "content":{"text":"[[BUZZ_FINAL:fresh]]hello[[/BUZZ_FINAL:fresh]]"}
         }}});
         client.handle_session_update(&update);
-        assert_eq!(client.take_turn_output().final_text(), Ok(Some("hello".into())));
+        assert_eq!(
+            client.take_turn_output().final_text(),
+            Ok(Some("hello".into()))
+        );
         client.begin_publication_turn("fresh");
         client.handle_session_update(&update);
         client.handle_session_update(&serde_json::json!({"params":{"update":{
@@ -3859,7 +3861,11 @@ mod tests {
     async fn publication_capture_does_not_guess_success_from_help_or_command_text() {
         let mut client = spawn_inert_client().await;
         client.output_mode = crate::auto_publish::OutputMode::ConversationalFinal;
-        for command in ["buzz messages send --help", "bash reply.sh", "buzz messages  send --content hi"] {
+        for command in [
+            "buzz messages send --help",
+            "bash reply.sh",
+            "buzz messages  send --content hi",
+        ] {
             client.begin_publication_turn("fresh");
             client.handle_session_update(&serde_json::json!({"params":{"update":{
                 "sessionUpdate":"agent_message_chunk",
