@@ -557,8 +557,9 @@ pub async fn add_member(
 
 /// Remove a member from a channel (soft delete).
 ///
-/// `actor_pubkey` must be an active owner/admin, the agent's owner, or the member
-/// removing themselves.
+/// `actor_pubkey` must be an active owner/admin, the agent's owner, a relay
+/// owner/admin (community-wide authority, including DMs where every participant
+/// is a plain member), or the member removing themselves.
 ///
 /// Returns `Err(DbError::MemberNotFound)` if the target is not an active member.
 ///
@@ -604,7 +605,7 @@ pub async fn remove_member(
     // as `add_member`).
     acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
 
-    if !is_self_remove {
+    if !is_self_remove && !is_relay_owner_or_admin_tx(&mut tx, community_id, actor_pubkey).await? {
         let actor_role_str = get_active_role_tx(&mut tx, community_id, channel_id, actor_pubkey)
             .await?
             .ok_or_else(|| DbError::AccessDenied("actor is not an active member".to_string()))?;
@@ -1103,6 +1104,25 @@ async fn get_active_role_tx(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(row.map(|r| r.try_get("role")).transpose()?)
+}
+
+/// Returns `true` when `pubkey` holds the community-wide relay `owner` or
+/// `admin` role. Mirrors the relay-layer `classify_remove_other` rule so the
+/// DB layer does not reject a removal the relay already authorized.
+async fn is_relay_owner_or_admin_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    pubkey: &[u8],
+) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM relay_members \
+         WHERE community_id = $1 AND pubkey = $2 AND role IN ('owner', 'admin')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(hex::encode(pubkey))
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// Transaction-aware variant of [`get_channel`].
@@ -2980,6 +3000,77 @@ mod postgres_tests {
         assert!(
             members.iter().any(|m| m.pubkey == victim),
             "victim must not have been removed by a demoted actor"
+        );
+    }
+
+    /// A relay owner/admin holds community-wide authority, so the DB layer must
+    /// accept a removal the relay authorized even when the actor is only a plain
+    /// channel member (every DM participant is). A plain member without the
+    /// relay role must still be rejected.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn relay_admin_removes_dm_member_but_plain_member_cannot() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let (admin, plain, target) = (random_pubkey(), random_pubkey(), random_pubkey());
+        for pk in [&admin, &plain, &target] {
+            ensure_user(&pool, community, pk)
+                .await
+                .expect("ensure user");
+        }
+        let dm = create_test_channel(
+            &pool,
+            community_id,
+            "relay-admin-dm",
+            ChannelType::Dm,
+            ChannelVisibility::Private,
+            None,
+            &admin,
+            None,
+        )
+        .await
+        .expect("create dm");
+        // Real DMs hold every participant at the plain `member` role.
+        sqlx::query("UPDATE channel_members SET role = 'member' WHERE channel_id = $1")
+            .bind(dm.id)
+            .execute(&pool)
+            .await
+            .expect("demote dm creator to member");
+        for pk in [&plain, &target] {
+            sqlx::query(
+                "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+                 VALUES ($1, $2, $3, 'member')",
+            )
+            .bind(community_id)
+            .bind(dm.id)
+            .bind(pk)
+            .execute(&pool)
+            .await
+            .expect("add dm member");
+        }
+        sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, 'admin')",
+        )
+        .bind(community_id)
+        .bind(hex::encode(&admin))
+        .execute(&pool)
+        .await
+        .expect("grant relay admin");
+
+        let denied = remove_member(&pool, community, dm.id, &target, &plain).await;
+        assert!(
+            matches!(denied, Err(DbError::AccessDenied(_))),
+            "plain member without relay role must not remove others: {denied:?}"
+        );
+
+        remove_member(&pool, community, dm.id, &target, &admin)
+            .await
+            .expect("relay admin removes a DM member");
+        let members = get_members(&pool, community, dm.id).await.expect("members");
+        assert!(
+            !members.iter().any(|m| m.pubkey == target),
+            "target must be removed by the relay admin"
         );
     }
 
