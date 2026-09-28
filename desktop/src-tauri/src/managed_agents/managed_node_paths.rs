@@ -61,7 +61,18 @@ pub(crate) fn buzz_managed_command_path(command: &str, basename: &str) -> Option
     if command.contains(std::path::MAIN_SEPARATOR)
         || !matches!(
             command,
-            "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "node" | "npm"
+            "codex-acp"
+                | "claude-agent-acp"
+                | "claude-code-acp"
+                | "node"
+                | "npm"
+                | "npx"
+                | "buzz-pi-acp"
+                | "pi"
+                | "omp"
+                | "opencode"
+                | "deepseek-acp"
+                | "dsh"
         )
     {
         return None;
@@ -97,5 +108,36 @@ fn is_executable_file(path: &std::path::Path) -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitelisted_commands_are_recognized() {
+        const WHITELISTED: &[&str] = &[
+            "codex-acp",
+            "claude-agent-acp",
+            "claude-code-acp",
+            "node",
+            "npm",
+            "npx",
+            "buzz-pi-acp",
+            "pi",
+            "omp",
+            "opencode",
+            "deepseek-acp",
+            "dsh",
+        ];
+        for cmd in WHITELISTED {
+            // Path separator check
+            assert!(buzz_managed_command_path(&format!("sub/{cmd}"), cmd).is_none());
+        }
+        // Non-whitelisted commands should be rejected unconditionally
+        assert!(buzz_managed_command_path("malicious-tool", "malicious-tool").is_none());
+        assert!(buzz_managed_command_path("curl", "curl").is_none());
+        assert!(buzz_managed_command_path("bash", "bash").is_none());
     }
 }
