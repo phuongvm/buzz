@@ -347,11 +347,13 @@ fn restricted_write_lands_owner_only_without_post_write_chmod() {
 
 #[test]
 fn agent_store_deserialization_tolerates_utf8_bom() {
-    let with_bom = "\u{feff}[{\"name\":\"bom-agent\"}]";
+    let json = serde_json::to_string(&vec![record_with_key("")]).expect("serialize");
+    let with_bom = format!("\u{feff}{json}");
+    assert!(serde_json::from_str::<Vec<ManagedAgentRecord>>(&with_bom).is_err());
     let records: Vec<ManagedAgentRecord> =
-        serde_json::from_str(crate::util::trim_bom(with_bom)).expect("deserialization with BOM");
+        serde_json::from_str(crate::util::trim_bom(&with_bom)).expect("deserialization with BOM");
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].name, "bom-agent");
+    assert_eq!(records[0].name, "test-agent");
 }
 
 #[test]
