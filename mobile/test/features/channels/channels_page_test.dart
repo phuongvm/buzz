@@ -1,3 +1,5 @@
+import 'package:buzz/features/pairing/pairing_provider.dart';
+import 'package:buzz/shared/community/paired_community_landing.dart';
 import 'dart:async';
 
 import '../profile/presence_snapshot_test.dart'
@@ -894,7 +896,7 @@ void main() {
     expect(profileRect.center.dy, communityRect.center.dy);
   });
 
-  testWidgets('reveals channel content from same-slot reconnect skeletons', (
+  testWidgets('keeps cached channels visible while reconnecting', (
     tester,
   ) async {
     final relaySession = _ReconnectingRelaySession();
@@ -907,59 +909,53 @@ void main() {
       ),
     );
     await tester.pump();
-    await tester.pump(const Duration(seconds: 2));
-    await tester.pump();
-
-    final skeleton = find.byKey(const Key('channels-connection-skeleton'));
-    expect(skeleton, findsOneWidget);
-    expect(
-      find.descendant(of: skeleton, matching: find.byType(SkeletonBar)),
-      findsWidgets,
-    );
-    expect(
-      find.descendant(
-        of: skeleton,
-        matching: find.byType(CircularProgressIndicator),
-      ),
-      findsNothing,
-    );
-    expect(
-      tester
-          .widget<Opacity>(find.byKey(const Key('skeleton-reveal-placeholder')))
-          .opacity,
-      1,
-    );
-    expect(
-      tester
-          .widget<Opacity>(find.byKey(const Key('skeleton-reveal-content')))
-          .opacity,
-      0,
-    );
-
-    relaySession.connect();
-    await tester.pump();
-    await tester.pump();
+    await tester.pump(const Duration(seconds: 3));
     expect(
       tester.widget<SkeletonReveal>(find.byType(SkeletonReveal)).loading,
       isFalse,
     );
-    await tester.pump(const Duration(milliseconds: 200));
-
     expect(
       tester
-          .widget<Opacity>(find.byKey(const Key('skeleton-reveal-placeholder')))
+          .widget<Opacity>(find.byKey(const Key('skeleton-reveal-content')))
           .opacity,
-      closeTo(0.5, 0.01),
+      1,
+    );
+    expect(find.text('general'), findsOneWidget);
+    relaySession.connect();
+    await tester.pumpAndSettle();
+    expect(find.text('general'), findsOneWidget);
+  });
+
+  testWidgets('keeps a fetched empty channel list visible during reconnect', (
+    tester,
+  ) async {
+    final relaySession = _ReconnectingRelaySession(
+      initialStatus: SessionStatus.connected,
+    );
+    await tester.pumpWidget(
+      buildTestable(
+        overrides: [
+          channelsProvider.overrideWith(() => _FakeNotifier(const [])),
+          relaySessionProvider.overrideWith(() => relaySession),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('No conversations yet'), findsOneWidget);
+    relaySession.setReconnecting();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 3));
+    expect(
+      tester.widget<SkeletonReveal>(find.byType(SkeletonReveal)).loading,
+      isFalse,
     );
     expect(
       tester
           .widget<Opacity>(find.byKey(const Key('skeleton-reveal-content')))
           .opacity,
-      closeTo(0.5, 0.01),
+      1,
     );
-
-    await tester.pump(const Duration(milliseconds: 200));
-    expect(find.text('general'), findsOneWidget);
+    expect(find.text('No conversations yet'), findsOneWidget);
   });
 
   testWidgets('announces neutral loading outside connection transitions', (
@@ -1779,6 +1775,95 @@ void main() {
       findsOneWidget,
     );
   });
+
+  for (final reduceMotion in [false, true]) {
+    testWidgets(
+      'paired community waits then uses the community landing (reduced motion: $reduceMotion)',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        addTearDown(() => debugDefaultTargetPlatformOverride = null);
+        tester.view.physicalSize = const Size(390, 844);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        final community = Community(
+          id: 'alpha',
+          name: 'Alpha',
+          relayUrl: 'wss://alpha.example.com',
+          addedAt: DateTime(2025),
+        );
+        final notifier = _FakeCommunityListNotifier([community]);
+        final loaded = Completer<List<Channel>>();
+        await tester.pumpWidget(
+          buildTestable(
+            disableAnimations: reduceMotion,
+            overrides: [
+              pairingProvider.overrideWith(_CompletedPairingNotifier.new),
+              channelsProvider.overrideWith(
+                () => _FakeNotifier(testChannels, load: () => loaded.future),
+              ),
+              communityListProvider.overrideWith(() => notifier),
+              activeCommunityProvider.overrideWith((ref) async => community),
+            ],
+          ),
+        );
+        await tester.pump();
+        final context = tester.element(find.byType(ChannelsPage));
+        final container = ProviderScope.containerOf(context);
+        // A successful add-community pairing still has a route to dismiss.
+        final navigator = Navigator.of(context);
+        unawaited(
+          navigator.push<void>(
+            MaterialPageRoute(
+              builder: (_) => const Scaffold(body: Text('Pairing complete')),
+            ),
+          ),
+        );
+        await tester.pump();
+        container
+            .read(pairedCommunityLandingProvider.notifier)
+            .request(community);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
+        expect(find.byKey(const Key('community-flying-avatar')), findsNothing);
+        navigator.pop();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
+        await tester.pump();
+        await tester.pump();
+        final avatar = find.byKey(const Key('community-flying-avatar'));
+        expect(avatar, findsOneWidget);
+        expect(tester.getCenter(avatar), const Offset(195, 422));
+        expect(
+          find.byKey(const Key('community-switch-loading')),
+          findsOneWidget,
+        );
+        expect(container.read(pairedCommunityLandingProvider), isNull);
+        expect(notifier.switchedIds, isEmpty);
+        loaded.complete(
+          testChannels.where((channel) => channel.channelType != 'dm').toList(),
+        );
+        for (var i = 0; i < 12; i++) {
+          await tester.pump();
+        }
+        await tester.pump(const Duration(milliseconds: 450));
+        for (var i = 0; i < 6; i++) {
+          await tester.pump();
+        }
+        if (!reduceMotion) {
+          await tester.pump(const Duration(milliseconds: 260));
+          expect(tester.getCenter(avatar).dy, lessThan(422));
+        }
+        await tester.pumpAndSettle();
+        expect(avatar, findsNothing);
+        expect(find.byKey(const Key('community-switch-loading')), findsNothing);
+        expect(notifier.switchedIds, isEmpty);
+        expect(container.read(pairingProvider).status, PairingStatus.idle);
+        expect(tester.takeException(), isNull);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+  }
 
   for (final nativeHeader in [false, true]) {
     for (final reduceMotion in [false, true]) {
@@ -3832,4 +3917,9 @@ class _SwitchingUserCache extends UserCacheNotifier {
     };
     loaded.complete(true);
   }
+}
+
+class _CompletedPairingNotifier extends PairingNotifier {
+  @override
+  PairingState build() => const PairingState(status: PairingStatus.success);
 }
