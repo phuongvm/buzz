@@ -75,10 +75,20 @@ void main() {
       );
       expect(find.text('Invite to community'), findsNothing);
       await tester.pumpAndSettle();
+      final version = find.text(
+        buildNumber.isEmpty ? 'v0.16.0' : 'v0.16.0 ($buildNumber)',
+      );
+      await tester.scrollUntilVisible(version, 200);
+      await tester.pumpAndSettle();
+      expect(version.hitTestable(), findsOneWidget);
       expect(
-        find.text(buildNumber.isEmpty ? 'v0.16.0' : 'v0.16.0 ($buildNumber)'),
+        find.ancestor(of: version, matching: find.byType(ListView)),
         findsOneWidget,
       );
+      final beforeScroll = tester.getTopLeft(version).dy;
+      await tester.drag(find.byType(ListView), const Offset(0, 100));
+      await tester.pumpAndSettle();
+      expect(tester.getTopLeft(version).dy, greaterThan(beforeScroll));
       expect(tester.takeException(), isNull);
     });
   }
@@ -295,8 +305,7 @@ void main() {
           await tester.runAsync(() async {
             for (final font in {
               'Inter': 'assets/fonts/InterVariable.ttf',
-              'packages/lucide_icons_flutter/Lucide':
-                  'packages/lucide_icons_flutter/assets/lucide.ttf',
+              'BuzzTabler': 'assets/fonts/TablerIcons.ttf',
             }.entries) {
               await (FontLoader(
                 font.key,
