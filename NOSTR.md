@@ -67,7 +67,7 @@ PGPASSWORD=buzz_dev psql -h localhost -U buzz -d buzz -c \
 | **NIP-42 authentication** | ✅ | Proactive challenge; optional pubkey allowlist |
 | **NIP-11 relay info** | ✅ | `GET /` with `Accept: application/nostr+json` |
 | **Blossom media** | ✅ | `PUT /media/upload` (BUD-02), `GET /media/{sha256}.{ext}` (BUD-01) |
-| **NIP-50 search** | ✅ | One-shot search REQs: `{"search":"query","kinds":[9],"#h":["<uuid>"]}` → relevance-sorted results → EOSE. Not registered as persistent subscriptions. |
+| **NIP-50 search** | ✅ | One-shot search REQs: `{"search":"query","kinds":[9],"#h":["<uuid>"]}` → relevance-sorted results → EOSE. Not registered as persistent subscriptions. HTTP `POST /query` also accepts `search_sort: "newest"` (advertised as `buzz-search-sort` in NIP-11 `supported_extensions`) for newest-first results, paged with `page`. |
 | **NIP-10 threads** | ✅ | WS-submitted replies with `["e","<root>","","reply"]` tags create `thread_metadata` atomically. Visible in REST thread queries. Unknown parents rejected. |
 | **NIP-17 DMs (gift wrap)** | ✅ | kind:1059 accepted with ephemeral signing keys. Stored community-globally (`channel_id=None` inside the connected community). Delivered via `#p`-filtered subscriptions. Not indexed in search. |
 | **DM discovery** | ✅ | DM creation emits kind:39000 (with `hidden` tag) + kind:44100 membership notifications. NIP-29 clients discover DMs via standard group discovery flow. |
@@ -135,6 +135,24 @@ The relay refuses a label set with more than 8 distinct labels, a label
 that is not 1-64 characters from `a-z`, `0-9`, `.`, `:` and `-`, or a
 label equal to a channel type name (`stream`, `forum`, `dm`, `workflow`,
 `system`).
+
+**System channels.** A channel with `channel_type` `system` exists only for
+access control, for example to hold config that only an agent and its owner
+can read. It is an ordinary channel in every other way, but queries leave it
+out unless they ask for it:
+
+- A filter that does not name it, for example a REQ with no `#h`, a COUNT,
+  a NIP-50 search, or kind:39002 `#p:[me]`, does not return it.
+- A filter that names it with `#h`, or with `#d` on kinds 39000–39003, reads
+  it under the ordinary rules: the reader is a member, or it is open.
+- A filter on kinds 39000–39003 with `#t:["system"]` or any `#P` also
+  returns the system channels the reader can read, then matches as usual.
+  For example, `{kinds:[39000], #P:[<creator>], #t:[<label>]}` finds one
+  creator's labeled channel, system or not. Values in one tag filter
+  combine with OR, so `#t:["system", <label>]` does not mean "a system
+  channel with this label".
+
+Push and kind:44100/44101 membership notifications skip system channels.
 
 Events are stored **channel-scoped** so access control applies — private channel member lists are
 only visible to members. Discover groups via historical REQ:
