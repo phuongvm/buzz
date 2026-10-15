@@ -178,6 +178,9 @@ run_unit_tests() {
   run_test_step "buzz-relay push runtime tests" \
     cargo test -p buzz-relay --lib push_runtime:: -- --nocapture
 
+  run_test_step "buzz-relay operator listener tests" \
+    cargo test -p buzz-relay --lib operator_listener::tests:: -- --nocapture
+
   run_test_step "buzz-relay channel authorization tests" \
     cargo test -p buzz-relay --lib handlers::channel_authz:: -- --nocapture
 
@@ -243,7 +246,8 @@ run_unit_tests() {
       handlers::req::tests::claims_after_connection_cleanup_are_refused \
       handlers::req::tests::dropped_terminal_frame_cancels_connection \
       handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection \
-      handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions
+      handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions \
+      handlers::req::tests::group_state_t_and_creator_tags_reach_sql_only_for_group_state_kinds
 
   run_test_step "buzz-relay readiness tests" \
     cargo test -p buzz-relay --lib readiness::tests:: -- --nocapture

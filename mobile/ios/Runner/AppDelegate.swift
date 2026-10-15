@@ -1073,11 +1073,13 @@ import os.log
 }
 
 extension BuzzPushNavigationTarget {
-  fileprivate var flutterArguments: [String: String] {
-    [
+  var flutterArguments: [String: String] {
+    var arguments = [
       "eventId": eventID,
       "communityId": communityID,
       "channelId": channelID,
     ]
+    arguments["threadRootId"] = threadRootID
+    return arguments
   }
 }

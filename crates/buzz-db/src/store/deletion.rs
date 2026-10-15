@@ -2955,27 +2955,14 @@ impl DeletionStore {
     }
 
     /// Take the shared community deletion lock inside an existing transaction.
+    ///
+    /// See [`guard_community_write`].
     pub async fn guard_transaction(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         community: CommunityId,
     ) -> Result<()> {
-        lock_community_deletion_shared(tx, community).await?;
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT deletion_state FROM communities WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(community.as_uuid())
-        .fetch_optional(&mut **tx)
-        .await?;
-        match state.as_deref() {
-            Some("active") => Ok(()),
-            Some(other) => Err(DbError::AccessDenied(format!(
-                "community {community} is write-fenced ({other})"
-            ))),
-            None => Err(DbError::AccessDenied(format!(
-                "community {community} is missing or tombstoned"
-            ))),
-        }
+        guard_community_write(tx, community).await
     }
 
     /// Take the shared community deletion lock inside an existing transaction
@@ -3340,6 +3327,36 @@ async fn lock_community_deletion(
     )
     .await?;
     Ok(())
+}
+
+/// Admit a community write inside an existing transaction.
+///
+/// Takes the shared community deletion lock, then requires the community to
+/// be `active` and not tombstoned. Refusal is [`DbError::AccessDenied`];
+/// a lock timeout surfaces as the underlying `55P03` database error. The
+/// lock is transaction-scoped, so commit, rollback, or a dropped transaction
+/// releases it. Crates outside `buzz-db` that own their own transactions
+/// (the audit chain) admit through this function.
+pub async fn guard_community_write(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+) -> Result<()> {
+    lock_community_deletion_shared(tx, community).await?;
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT deletion_state FROM communities WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(community.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    match state.as_deref() {
+        Some("active") => Ok(()),
+        Some(other) => Err(DbError::AccessDenied(format!(
+            "community {community} is write-fenced ({other})"
+        ))),
+        None => Err(DbError::AccessDenied(format!(
+            "community {community} is missing or tombstoned"
+        ))),
+    }
 }
 
 pub(crate) async fn lock_community_deletion_shared(
@@ -6287,17 +6304,27 @@ mod postgres_tests {
             mismatched_approval.is_err(),
             "approval digest must remain database-bound to the frozen request digest"
         );
+        // PostgreSQL sends this rejection before it rolls the statement back
+        // and releases the request row lock, and sqlx returns on the error.
+        // The claim below uses SKIP LOCKED on another pooled connection, so
+        // finish a round trip on this connection before claiming.
+        let mut tamper_conn = db.pool.acquire().await.expect("acquire tamper connection");
         let mismatched_request = sqlx::query(
             "UPDATE community_deletion_requests SET inventory_digest = $2 WHERE id = $1",
         )
         .bind(request.id)
         .bind(vec![1_u8; 32])
-        .execute(&db.pool)
+        .execute(&mut *tamper_conn)
         .await;
         assert!(
             mismatched_request.is_err(),
             "the frozen request digest must remain bound to its approval"
         );
+        sqlx::query("SELECT 1")
+            .execute(&mut *tamper_conn)
+            .await
+            .expect("rejected update has rolled back");
+        drop(tamper_conn);
         assert!(store
             .claim_specific(request.id, "executor-a", DEFAULT_LEASE_DURATION)
             .await

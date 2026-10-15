@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:buzz/shared/push/push_bridge.dart';
 import 'package:buzz/features/channels/channel_actions_sheet.dart';
 
 import '../profile/presence_snapshot_test.dart'
@@ -44,6 +45,7 @@ import 'package:buzz/features/channels/day_divider.dart';
 import 'package:buzz/features/channels/emoji_picker.dart';
 import 'package:buzz/features/channels/ime_metrics_settle_observer.dart';
 import 'package:buzz/features/channels/local_message_send_animation_provider.dart';
+import 'package:buzz/features/channels/local_send_bubble_surface.dart';
 import 'package:buzz/features/channels/message_action_backdrop_state.dart';
 import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/mobile_huddle_controller.dart';
@@ -78,11 +80,14 @@ import 'package:buzz/shared/widgets/tabler_star_icon.dart';
 import 'package:buzz/shared/widgets/skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../helpers/thread_ids.dart';
+
 part 'thread_reply_refresh_cases.dart';
 part 'thread_title_capsule_cases.dart';
 part 'channel_detail_page_test/loading_review_tests.dart';
 part 'channel_detail_page_test/presence_tests.dart';
 part 'channel_detail_page_test/action_row_tests.dart';
+part 'channel_detail_page_test/bubble_tests.dart';
 
 const _channelId = '11111111-2222-4333-8444-555555555555';
 const _huddleChannelId = '8d764100-fd8f-44cf-9c98-6d8fbd739b8c';
@@ -218,6 +223,9 @@ NostrEvent _edit({
 );
 
 Widget _buildTestable({
+  ProfileNotifier? profileNotifier,
+  String? signingPubkey,
+  bool darkTheme = false,
   required List<NostrEvent> messages,
   PresenceCacheNotifier? presenceCache,
   List<TypingEntry> typing = const [],
@@ -293,7 +301,11 @@ Widget _buildTestable({
       userCacheProvider.overrideWith(
         () => userCacheNotifier ?? _FakeUserCacheNotifier(users),
       ),
-      profileProvider.overrideWith(() => _FakeProfileNotifier()),
+      profileProvider.overrideWith(
+        () => profileNotifier ?? _FakeProfileNotifier(),
+      ),
+      if (signingPubkey != null)
+        myPubkeyProvider.overrideWithValue(signingPubkey),
       if (presenceCache != null)
         presenceCacheProvider.overrideWith(() => presenceCache),
       channelsProvider.overrideWith(() => fakeChannelsNotifier),
@@ -403,7 +415,7 @@ Widget _buildTestable({
     ],
     child: MaterialApp(
       navigatorKey: navigatorKey,
-      theme: AppTheme.light(),
+      theme: darkTheme ? AppTheme.dark() : AppTheme.light(),
       builder: (context, child) => MediaQuery(
         data: MediaQuery.of(context).copyWith(
           textScaler: textScaler,
@@ -505,6 +517,7 @@ void main() {
   threadTitleCapsuleTests();
   presenceTests();
   actionRowTests();
+  bubbleLayoutTests();
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     _testPrefs = await SharedPreferences.getInstance();
@@ -600,6 +613,8 @@ void main() {
                   },
                   threadReplies: const {'qualified': []},
                   initialThreadRootId: thread ? 'qualified' : null,
+                  // 48 mounts each open the sheet twice; skip its motion.
+                  disableAnimations: true,
                 ),
               );
               await tester.pumpAndSettle();
@@ -624,7 +639,7 @@ void main() {
       'bot-role author avatars stay squircles in channel and thread',
       (tester) async {
         final message = _textMsg(
-          id: 'bot-message',
+          id: threadIdBotDashMessage,
           pubkey: 'bot',
           content: 'Bot message',
         );
@@ -634,7 +649,7 @@ void main() {
           content: 'Reply to bot',
           createdAt: 1100,
           extraTags: const [
-            ['e', 'bot-message', '', 'reply'],
+            ['e', threadIdBotDashMessage, '', 'reply'],
           ],
         );
         await tester.pumpWidget(
@@ -645,27 +660,38 @@ void main() {
             },
             loadChannelBotPubkeys: () async => const {'bot'},
             threadReplies: {
-              'bot-message': [reply],
+              threadIdBotDashMessage: [reply],
             },
           ),
         );
         await tester.pumpAndSettle();
 
         AvatarImage avatarIn(Finder row) => tester.widget<AvatarImage>(
-          find.descendant(of: row, matching: find.byType(AvatarImage)),
+          find.descendant(
+            of: row,
+            matching: find.byWidgetPredicate(
+              (widget) =>
+                  widget is AvatarImage &&
+                  widget.radius == messageAvatarSize / 2,
+            ),
+          ),
         );
         expect(
           avatarIn(
-            find.byKey(const ValueKey('message-row-bot-message')),
+            find.byKey(const ValueKey('message-row-$threadIdBotDashMessage')),
           ).isAgent,
           isTrue,
         );
 
-        await tester.tap(find.byKey(const ValueKey('message-row-bot-message')));
+        await tester.tap(
+          find.byKey(const ValueKey('message-row-$threadIdBotDashMessage')),
+        );
         await tester.pumpAndSettle();
         expect(
           avatarIn(
-            find.byKey(const ValueKey('thread-message-row-bot-message')),
+            find.byKey(
+              const ValueKey('thread-message-row-$threadIdBotDashMessage'),
+            ),
           ).isAgent,
           isTrue,
         );
@@ -2092,7 +2118,9 @@ void main() {
       expect(find.byType(SkeletonReveal), findsNothing);
     });
 
-    testWidgets('defers read-state mark until after build', (tester) async {
+    testWidgets('reading the bottom writes the catch-up mark after the dwell', (
+      tester,
+    ) async {
       final readState = _SynchronousReadStateNotifier(
         const ReadStateState(
           isReady: true,
@@ -2124,9 +2152,619 @@ void main() {
 
       expect(tester.takeException(), isNull);
       await tester.pump();
+      // Opening the channel does not read it; holding still at the bottom
+      // does, without moving the channel mark.
+      expect(readState.markedContexts, isEmpty);
 
-      expect(readState.markedContexts, {_channelId: 1200});
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(readState.markedContexts, {'activity:$_channelId': 1200});
       expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('reading the bottom ends a manual channel unread only', (
+      tester,
+    ) async {
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {},
+          version: 0,
+          forcedUnreadContexts: {_channelId: _channelId, 'msg:old': _channelId},
+        ),
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(
+              id: 'msg1',
+              pubkey: 'alice',
+              content: 'Latest',
+              createdAt: 1200,
+            ),
+          ],
+          readStateNotifier: readState,
+        ),
+      );
+      await tester.pump();
+      expect(readState.clearedForcedContexts, isEmpty);
+
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(readState.clearedForcedContexts, [_channelId]);
+      // The channel mark does not move, and a message the reader marked
+      // unread stays unread.
+      expect(readState.markedContexts, {'activity:$_channelId': 1200});
+      expect(readState.state.isForcedUnread('msg:old'), isTrue);
+    });
+
+    testWidgets('opening a DM reads the whole DM', (tester) async {
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {},
+          version: 0,
+        ),
+      );
+      final dmChannel = Channel(
+        id: _channelId,
+        name: 'DM',
+        channelType: 'dm',
+        visibility: 'private',
+        description: 'Direct message',
+        createdBy: 'self',
+        createdAt: DateTime(2025),
+        memberCount: 2,
+        participants: const ['Self', 'Alice'],
+        participantPubkeys: const ['self', 'alice'],
+        isMember: true,
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(
+              id: 'msg1',
+              pubkey: 'alice',
+              content: 'First',
+              createdAt: 1100,
+            ),
+            _textMsg(
+              id: 'reply1',
+              pubkey: 'alice',
+              content: 'Newest reply',
+              createdAt: 1300,
+              extraTags: const [
+                ['e', 'msg1', '', 'reply'],
+              ],
+            ),
+          ],
+          channel: dmChannel,
+          relaySessionNotifier: PresenceTestRelay()..emptySnapshots = true,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+          readStateNotifier: readState,
+        ),
+      );
+      await tester.pump();
+
+      // No dwell needed: opening the DM reads through its newest message,
+      // replies included.
+      expect(readState.markedContexts[_channelId], 1300);
+    });
+
+    for (final covered in ['a sheet', 'the app switcher']) {
+      testWidgets('a DM behind $covered reads a new reply only '
+          'when shown again', (tester) async {
+        final readState = _SynchronousReadStateNotifier(
+          const ReadStateState(
+            isReady: true,
+            pubkey: 'self',
+            contexts: {},
+            version: 0,
+          ),
+        );
+        final first = _textMsg(
+          id: 'msg1',
+          pubkey: 'alice',
+          content: 'First',
+          createdAt: 1100,
+        );
+        final messages = _FakeMessagesNotifier([first]);
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: const [],
+            messagesNotifier: messages,
+            channel: Channel(
+              id: _channelId,
+              name: 'DM',
+              channelType: 'dm',
+              visibility: 'private',
+              description: 'Direct message',
+              createdBy: 'self',
+              createdAt: DateTime(2025),
+              memberCount: 2,
+              participants: const ['Self', 'Alice'],
+              participantPubkeys: const ['self', 'alice'],
+              isMember: true,
+            ),
+            relaySessionNotifier: PresenceTestRelay()..emptySnapshots = true,
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            },
+            readStateNotifier: readState,
+          ),
+        );
+        await tester.pump();
+        expect(readState.markedContexts[_channelId], 1100);
+
+        if (covered == 'a sheet') {
+          // A sheet keeps the page on screen, so its providers stay live.
+          unawaited(
+            showModalBottomSheet<void>(
+              context: tester.element(find.byType(ChannelDetailPage)),
+              builder: (_) => const Text('Cover'),
+            ),
+          );
+          await tester.pumpAndSettle();
+        } else {
+          // Inactive, unlike paused, still draws frames.
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.inactive,
+          );
+          await tester.pump();
+        }
+        messages.setMessages([
+          first,
+          _textMsg(
+            id: 'reply1',
+            pubkey: 'alice',
+            content: 'Unseen reply',
+            createdAt: 1300,
+            extraTags: const [
+              ['e', 'msg1', '', 'reply'],
+            ],
+          ),
+        ]);
+        await tester.pump();
+        await tester.pump();
+
+        // The reply loaded while the DM was covered, so it stays unread.
+        expect(readState.markedContexts[_channelId], 1100);
+
+        if (covered == 'a sheet') {
+          Navigator.of(tester.element(find.text('Cover'))).pop();
+          await tester.pumpAndSettle();
+        } else {
+          tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.resumed,
+          );
+          await tester.pump();
+          await tester.pump();
+        }
+
+        // Shown again, the DM reads through the reply.
+        expect(readState.markedContexts[_channelId], 1300);
+      });
+    }
+
+    testWidgets('reading away from the bottom marks only visible rows', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {},
+          version: 0,
+        ),
+      );
+      final messages = [
+        for (var i = 0; i < 40; i++)
+          _textMsg(
+            id: 'm$i',
+            pubkey: 'alice',
+            content: 'Message $i',
+            createdAt: 1000 + i,
+          ),
+      ];
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: messages,
+          initialMessageId: 'm5',
+          readStateNotifier: readState,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      final marked = readState.markedContexts;
+      expect(marked['msg:m5'], 1005);
+      expect(marked.keys.where((key) => !key.startsWith('msg:')), isEmpty);
+      // Rows below the viewport are not read.
+      expect(marked, isNot(contains('msg:m30')));
+      expect(marked, isNot(contains('msg:m39')));
+    });
+
+    testWidgets('reading a thread tail writes the thread catch-up mark', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {},
+          version: 0,
+        ),
+      );
+      final root = _textMsg(
+        id: threadIdRoot,
+        pubkey: 'alice',
+        content: 'Thread root',
+        createdAt: 1000,
+      );
+      final replies = [
+        for (var i = 0; i < 3; i++)
+          _textMsg(
+            id: 'reply$i',
+            pubkey: 'bob',
+            content: 'Reply $i',
+            createdAt: 1100 + i,
+            extraTags: const [
+              ['e', threadIdRoot, '', 'reply'],
+            ],
+          ),
+      ];
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [root],
+          threadReplies: {threadIdRoot: replies},
+          readStateNotifier: readState,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(readState.markedContexts, {'activity:$_channelId': 1000});
+      readState.markedContexts.clear();
+
+      Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ThreadDetailPage(
+            threadHead: formatTimeline([root]).single,
+            allMessages: formatTimeline([root, ...replies]),
+            channelId: _channelId,
+            currentPubkey: 'self',
+            isMember: true,
+            isArchived: false,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      // A catch-up mark reads the thread. Each visible reply keeps its own
+      // mark too, as in `buzz-app`: the thread mark reads a reply only while
+      // its root is loaded. The covered channel page does not read meanwhile.
+      expect(readState.markedContexts, {
+        'thread-activity:$threadIdRoot': 1102,
+        'msg:reply0': 1100,
+        'msg:reply1': 1101,
+        'msg:reply2': 1102,
+      });
+    });
+
+    testWidgets('a thread opened directly reads its head', (tester) async {
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {},
+          version: 0,
+        ),
+      );
+      // A mention: no catch-up mark reads it, so only its own mark does.
+      final root = _textMsg(
+        id: threadIdRoot,
+        pubkey: 'alice',
+        content: 'Thread root for @self',
+        createdAt: 1000,
+        extraTags: const [
+          ['p', 'self'],
+        ],
+      );
+      final reply = _textMsg(
+        id: 'reply0',
+        pubkey: 'bob',
+        content: 'Reply 0',
+        createdAt: 1100,
+        extraTags: const [
+          ['e', threadIdRoot, '', 'reply'],
+        ],
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [root, reply],
+          threadReplies: {
+            threadIdRoot: [reply],
+          },
+          initialThreadRootId: threadIdRoot,
+          readStateNotifier: readState,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(find.byType(ThreadDetailPage), findsOneWidget);
+      expect(readState.markedContexts['msg:$threadIdRoot'], 1000);
+      expect(readState.markedContexts['thread-activity:$threadIdRoot'], 1100);
+    });
+
+    testWidgets('a thread with no replies reads its head', (tester) async {
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {},
+          version: 0,
+        ),
+      );
+      final root = _textMsg(
+        id: threadIdRoot,
+        pubkey: 'alice',
+        content: 'Thread root for @self',
+        createdAt: 1000,
+        extraTags: const [
+          ['p', 'self'],
+        ],
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [root],
+          threadReplies: const {threadIdRoot: []},
+          readStateNotifier: readState,
+          home: ThreadDetailPage(
+            threadHead: formatTimeline([root]).single,
+            allMessages: formatTimeline([root]),
+            channelId: _channelId,
+            currentPubkey: 'self',
+            isMember: true,
+            isArchived: false,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(readState.markedContexts, {'msg:$threadIdRoot': 1000});
+    });
+
+    testWidgets('rows under the Android keyboard are not read in history', (
+      tester,
+    ) async {
+      final previousPlatform = debugDefaultTargetPlatformOverride;
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        tester.view.physicalSize = const Size(400, 800);
+        tester.view.devicePixelRatio = 1;
+        tester.view.viewPadding = const FakeViewPadding(bottom: 24);
+        addTearDown(tester.view.reset);
+        final readState = _SynchronousReadStateNotifier(
+          const ReadStateState(
+            isReady: true,
+            pubkey: 'self',
+            contexts: {},
+            version: 0,
+          ),
+        );
+        final messages = [
+          for (var i = 0; i < 40; i++)
+            _textMsg(
+              id: 'm$i',
+              pubkey: 'alice',
+              content: 'Message $i',
+              createdAt: 1000 + i,
+              extraTags: const [
+                ['p', 'self'],
+              ],
+            ),
+        ];
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: messages,
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            },
+            readStateNotifier: readState,
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('Message #general'));
+        await tester.pump();
+        tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+        await tester.pump();
+        await tester.pump(androidImeMetricsSettleDelay);
+        await tester.pumpAndSettle();
+
+        // Leave the latest message, then stop with history rows under the
+        // keyboard.
+        final messageList = find.byKey(const ValueKey('channel-message-list'));
+        final messageListElement = tester.element(messageList);
+        UserScrollNotification(
+          metrics: FixedScrollMetrics(
+            minScrollExtent: 0,
+            maxScrollExtent: 100,
+            pixels: 0,
+            viewportDimension: 100,
+            axisDirection: AxisDirection.down,
+            devicePixelRatio: 1,
+          ),
+          context: messageListElement,
+          direction: ScrollDirection.reverse,
+        ).dispatch(messageListElement);
+        // Settling can already complete the read dwell; record the whole jump.
+        readState.markedContexts.clear();
+        tester
+            .widget<ScrollablePositionedList>(messageList)
+            .itemScrollController!
+            .jumpTo(index: 20);
+        await tester.pumpAndSettle();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        final textField = tester.widget<TextField>(find.byType(TextField));
+        expect(textField.focusNode?.hasFocus, isTrue);
+        final coveredTop = tester
+            .getTopLeft(find.byKey(const ValueKey('channel-composer-dock')))
+            .dy;
+        final marked = readState.markedContexts.keys.toSet();
+        var hiddenRows = 0;
+        for (var i = 0; i < 40; i++) {
+          final row = find.byKey(ValueKey('channel-message-group-m$i'));
+          if (row.evaluate().isEmpty) continue;
+          final hidden = tester.getTopLeft(row).dy >= coveredTop;
+          if (hidden) {
+            hiddenRows++;
+            expect(marked, isNot(contains('msg:m$i')), reason: 'm$i');
+          }
+          if (marked.contains('msg:m$i')) {
+            // The reading edge allows 1% of the list height.
+            expect(
+              tester.getBottomLeft(row).dy,
+              lessThanOrEqualTo(coveredTop + 10),
+              reason: 'm$i',
+            );
+          }
+        }
+        // Rows sit under the keyboard, and rows above it are read.
+        expect(hiddenRows, greaterThan(0));
+        expect(marked, isNotEmpty);
+      } finally {
+        debugDefaultTargetPlatformOverride = previousPlatform;
+      }
+    });
+
+    testWidgets('thread rows under the Android keyboard are not read', (
+      tester,
+    ) async {
+      final previousPlatform = debugDefaultTargetPlatformOverride;
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        tester.view.physicalSize = const Size(400, 800);
+        tester.view.devicePixelRatio = 1;
+        tester.view.viewPadding = const FakeViewPadding(bottom: 24);
+        addTearDown(tester.view.reset);
+        final readState = _SynchronousReadStateNotifier(
+          const ReadStateState(
+            isReady: true,
+            pubkey: 'self',
+            contexts: {},
+            version: 0,
+          ),
+        );
+        final root = _textMsg(
+          id: threadIdRoot,
+          pubkey: 'alice',
+          content: 'Thread root',
+          createdAt: 1000,
+        );
+        final replies = [
+          for (var i = 0; i < 40; i++)
+            _textMsg(
+              id: 'reply$i',
+              pubkey: 'bob',
+              content: 'Reply $i',
+              createdAt: 1100 + i,
+              extraTags: const [
+                ['e', threadIdRoot, '', 'reply'],
+              ],
+            ),
+        ];
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [root],
+            threadReplies: {threadIdRoot: replies},
+            readStateNotifier: readState,
+            home: ThreadDetailPage(
+              threadHead: formatTimeline([root]).single,
+              allMessages: formatTimeline([root, ...replies]),
+              channelId: _channelId,
+              currentPubkey: 'self',
+              isMember: true,
+              isArchived: false,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Scroll into history, open the keyboard, then scroll toward newer
+        // replies without reaching the tail. An upward drag keeps the
+        // keyboard open.
+        final messageList = find.byKey(const ValueKey('thread-message-list'));
+        await tester.drag(messageList, const Offset(0, 600));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Reply in thread…').hitTestable());
+        await tester.pumpAndSettle();
+        tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+        await tester.pump();
+        await tester.pump(androidImeMetricsSettleDelay);
+        await tester.pumpAndSettle();
+        await tester.drag(messageList, const Offset(0, -150));
+        await tester.pumpAndSettle();
+        readState.markedContexts.clear();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        final textField = tester.widget<TextField>(find.byType(TextField));
+        expect(textField.focusNode?.hasFocus, isTrue);
+        final coveredTop = tester
+            .getTopLeft(find.byKey(const ValueKey('thread-composer-dock')))
+            .dy;
+        final marked = readState.markedContexts.keys.toSet();
+        expect(marked, isNot(contains('thread-activity:$threadIdRoot')));
+        var hiddenRows = 0;
+        for (var i = 0; i < 40; i++) {
+          final row = find.byKey(ValueKey('thread-message-group-reply$i'));
+          if (row.evaluate().isEmpty) continue;
+          if (tester.getTopLeft(row).dy >= coveredTop) {
+            hiddenRows++;
+            expect(marked, isNot(contains('msg:reply$i')), reason: 'reply$i');
+          }
+          if (marked.contains('msg:reply$i')) {
+            // The reading edge allows 1% of the list height.
+            expect(
+              tester.getBottomLeft(row).dy,
+              lessThanOrEqualTo(coveredTop + 10),
+              reason: 'reply$i',
+            );
+          }
+        }
+        // Replies sit under the keyboard. Replies above it were read
+        // before the keyboard opened, so they need no new marks.
+        expect(hiddenRows, greaterThan(0));
+      } finally {
+        debugDefaultTargetPlatformOverride = previousPlatform;
+      }
     });
 
     testWidgets('shows forum posts view for forum channels', (tester) async {
@@ -3190,23 +3828,26 @@ void main() {
       }
       final aliceName = find.text('Alice');
       final aliceText = tester.widget<Text>(aliceName);
-      expect(aliceText.style?.fontSize, messageUsernameTextStyle.fontSize);
+      expect(aliceText.style?.fontSize, 13.1);
       expect(aliceText.style?.fontWeight, messageUsernameTextStyle.fontWeight);
-      expect(aliceText.style?.height, messageUsernameTextStyle.height);
+      expect(aliceText.style?.height, 17 / 13.1);
       final aliceUsername = tester.widget<Text>(
         find.byKey(const ValueKey('message-username-msg1')),
       );
       final aliceTimestamp = tester.widget<Text>(
         find.byKey(const ValueKey('message-timestamp-msg1')),
       );
-      expect(aliceUsername.style?.fontSize, messageMetadataTextStyle.fontSize);
+      expect(aliceUsername.style?.fontSize, 13.1);
       expect(aliceUsername.style?.fontWeight, FontWeight.w400);
-      expect(aliceUsername.style?.height, messageMetadataTextStyle.height);
-      expect(
-        aliceTimestamp.style?.fontSize,
-        messageTimestampTextStyle.fontSize,
-      );
+      expect(aliceUsername.style?.height, 17 / 13.1);
+      expect(aliceTimestamp.style?.fontSize, 11);
       expect(aliceTimestamp.style?.fontWeight, FontWeight.w400);
+      expect(
+        tester
+            .getCenter(find.byKey(const ValueKey('message-timestamp-msg1')))
+            .dy,
+        closeTo(tester.getCenter(aliceName).dy, 0.01),
+      );
       expect(
         aliceTimestamp.style?.fontSize,
         lessThan(aliceText.style!.fontSize!),
@@ -3508,14 +4149,15 @@ void main() {
       },
     );
 
-    testWidgets('uses larger participant avatars in reply summaries', (
+    testWidgets('attaches replies after reactions with an eight pixel gap', (
       tester,
     ) async {
       await tester.pumpWidget(
         _buildTestable(
           messages: [
+            _reaction(id: 'reaction-root', targetId: threadIdRoot),
             _textMsg(
-              id: 'root',
+              id: threadIdRoot,
               pubkey: 'alice',
               content: 'Thread head',
               createdAt: 1000,
@@ -3526,7 +4168,7 @@ void main() {
               content: 'First reply',
               createdAt: 1100,
               extraTags: const [
-                ['e', 'root', '', 'reply'],
+                ['e', threadIdRoot, '', 'reply'],
               ],
             ),
             _textMsg(
@@ -3535,7 +4177,7 @@ void main() {
               content: 'Second reply',
               createdAt: 1200,
               extraTags: const [
-                ['e', 'root', '', 'reply'],
+                ['e', threadIdRoot, '', 'reply'],
               ],
             ),
           ],
@@ -3543,33 +4185,30 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(
-        findRichText(
-          '2 replies · last reply '
-          '${formatThreadSummaryLastReplyTime(1200)}',
-        ),
-        findsOneWidget,
-      );
-      expect(find.byIcon(BuzzIcons.chevronRight), findsNothing);
-      final replyAvatars = find.byType(SmallAvatar);
-      expect(replyAvatars, findsNWidgets(2));
-      for (final avatar in replyAvatars.evaluate()) {
+      expect(find.text('2 replies'), findsOneWidget);
+      expect(find.byIcon(BuzzIcons.messageSquareReply), findsNothing);
+      expect(find.byType(SmallAvatar), findsNWidgets(2));
+      for (final avatar in find.byType(SmallAvatar).evaluate()) {
         expect(
           tester.getSize(find.byWidget(avatar.widget)),
-          const Size.square(32),
+          const Size.square(20),
         );
       }
-      final summaryPadding = tester.widget<Padding>(
-        find.byKey(const ValueKey('thread-summary-root')),
-      );
+      final pill = find.byKey(const ValueKey('thread-summary-$threadIdRoot'));
+      final tray = find.byKey(const ValueKey('combined-reaction-tray'));
+      expect(tester.getTopLeft(pill).dx - tester.getTopRight(tray).dx, 8);
       expect(
-        summaryPadding.padding,
-        const EdgeInsets.only(
-          left: messageAvatarSize + messageAvatarContentGap,
-          top: Grid.half,
-          bottom: Grid.xs,
-        ),
+        tester.getCenter(pill).dy,
+        closeTo(tester.getCenter(tray).dy, 0.1),
       );
+      final body = find.text('Thread head', findRichText: true);
+      expect(
+        tester.getTopLeft(pill).dy,
+        lessThan(tester.getBottomLeft(body).dy + 24),
+      );
+      await tester.tap(pill);
+      await tester.pumpAndSettle();
+      expect(find.byType(ThreadDetailPage), findsOneWidget);
     });
 
     testWidgets('constrains reply summaries at accessibility text sizes', (
@@ -3586,19 +4225,19 @@ void main() {
         _buildTestable(
           messages: [
             _textMsg(
-              id: 'root',
+              id: threadIdRoot,
               pubkey: 'alice',
               content: 'Thread head',
               createdAt: lastReplyAt - 300,
             ),
-            for (var i = 0; i < 3; i++)
+            for (var i = 0; i < 4; i++)
               _textMsg(
                 id: 'reply-$i',
                 pubkey: 'participant-$i',
                 content: 'Reply $i',
                 createdAt: lastReplyAt - 2 + i,
                 extraTags: const [
-                  ['e', 'root', '', 'reply'],
+                  ['e', threadIdRoot, '', 'reply'],
                 ],
               ),
           ],
@@ -3608,9 +4247,10 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final summaryText = tester.widget<RichText>(findRichText('3 replies'));
+      final summaryText = tester.widget<RichText>(findRichText('4 replies'));
       expect(summaryText.maxLines, 2);
       expect(summaryText.overflow, TextOverflow.ellipsis);
+      expect(find.byType(SmallAvatar), findsNWidgets(3));
       expect(tester.takeException(), isNull);
     });
 
@@ -3862,7 +4502,7 @@ void main() {
             makeObservedUnreadEvent(
               id: 'thread-reply',
               createdAt: 1021,
-              rootId: 'thread-root',
+              rootId: threadIdThreadDashRoot,
               highPriority: true,
               channelType: 'stream',
               isThreadedReply: true,
@@ -4718,6 +5358,162 @@ void main() {
       );
     });
 
+    for (final dark in [false, true]) {
+      for (final thread in [false, true]) {
+        testWidgets(
+          'own bubble colors survive profile reloads dark=$dark thread=$thread',
+          (tester) async {
+            final events = [
+              _textMsg(
+                id: 'own-color',
+                pubkey: 'self',
+                content: 'My message',
+                createdAt: 2000,
+              ),
+              _textMsg(
+                id: 'other-color',
+                pubkey: 'other',
+                content: 'Their message',
+                createdAt: 2001,
+              ),
+            ];
+            final profile = _MutableColorProfileNotifier();
+            final timeline = formatTimeline(events, currentPubkey: 'self');
+            await tester.pumpWidget(
+              _buildTestable(
+                messages: events,
+                profileNotifier: profile,
+                signingPubkey: 'SELF',
+                darkTheme: dark,
+                home: thread
+                    ? ThreadDetailPage(
+                        threadHead: timeline.first,
+                        allMessages: timeline,
+                        channelId: _channelId,
+                        currentPubkey: null,
+                        isMember: true,
+                        isArchived: false,
+                      )
+                    : null,
+              ),
+            );
+            await tester.pumpAndSettle();
+            Color ownColor() => tester
+                .widget<LocalSendBubbleSurface>(
+                  find
+                      .descendant(
+                        of: find
+                            .ancestor(
+                              of: findRichText('My message'),
+                              matching: find.byType(MessageContent),
+                            )
+                            .first,
+                        matching: find.byType(LocalSendBubbleSurface),
+                      )
+                      .first,
+                )
+                .color;
+            final container = ProviderScope.containerOf(
+              tester.element(find.byType(MessageContent).first),
+            );
+            final subscription = container.listen(profileProvider, (_, _) {});
+            addTearDown(subscription.close);
+            final expected = dark ? const Color(0xFFF2F2F2) : Colors.black;
+            expect(ownColor(), expected);
+            for (final state in <AsyncValue<UserProfile?>>[
+              const AsyncLoading(),
+              AsyncError(StateError('Profile unavailable'), StackTrace.current),
+              const AsyncData(null),
+              const AsyncData(
+                UserProfile(pubkey: 'other', displayName: 'Stale profile'),
+              ),
+              const AsyncData(UserProfile(pubkey: 'self', displayName: 'Self')),
+            ]) {
+              profile.setProfileState(state);
+              await tester.pump();
+              expect(ownColor(), expected);
+            }
+            await tester.pumpAndSettle();
+          },
+        );
+      }
+    }
+
+    for (final platform in [TargetPlatform.iOS, TargetPlatform.android]) {
+      for (final multiline in [false, true]) {
+        testWidgets(
+          'group avatar stays fixed throughout a local send: $platform, multiline=$multiline',
+          (tester) async {
+            final previousPlatform = debugDefaultTargetPlatformOverride;
+            debugDefaultTargetPlatformOverride = platform;
+            try {
+              tester.view.physicalSize = const Size(400, 800);
+              tester.view.devicePixelRatio = 1;
+              addTearDown(tester.view.reset);
+              final initial = [
+                _textMsg(
+                  id: 'first',
+                  pubkey: 'self',
+                  content: 'First message',
+                  createdAt: 2000,
+                ),
+              ];
+              final notifier = _FakeMessagesNotifier(initial);
+              await tester.pumpWidget(
+                _buildTestable(
+                  messages: const [],
+                  messagesNotifier: notifier,
+                  users: const {
+                    'self': UserProfile(pubkey: 'self', displayName: 'Self'),
+                  },
+                ),
+              );
+              await tester.pumpAndSettle();
+              Finder avatar(String id) => find.descendant(
+                of: find.byKey(ValueKey('message-row-$id')),
+                matching: find.byType(AvatarImage),
+              );
+              final before = tester.getRect(avatar('first'));
+              final container = ProviderScope.containerOf(
+                tester.element(find.byType(ChannelDetailPage)),
+              );
+              container
+                  .read(localMessageSendAnimationProvider(_channelId).notifier)
+                  .mark('second');
+              notifier.setMessages([
+                ...initial,
+                _textMsg(
+                  id: 'second',
+                  pubkey: 'self',
+                  content: multiline
+                      ? 'Second message\nwith more lines\nand more text'
+                      : 'Second message',
+                  createdAt: 2001,
+                ),
+              ]);
+              for (var frame = 0; frame < 32; frame++) {
+                await tester.pump(const Duration(milliseconds: 16));
+                final visibleAvatar = avatar('second').evaluate().isNotEmpty
+                    ? avatar('second')
+                    : avatar('first');
+                expect(visibleAvatar, findsOneWidget);
+                final current = tester.getRect(visibleAvatar);
+                expect(
+                  current.top,
+                  closeTo(before.top, 1),
+                  reason: 'avatar frame $frame',
+                );
+              }
+              await tester.pumpAndSettle();
+              expect(avatar('second'), findsOneWidget);
+            } finally {
+              debugDefaultTargetPlatformOverride = previousPlatform;
+            }
+          },
+        );
+      }
+    }
+
     testWidgets(
       'a same-second local send follows its inserted row when the tail ID stays unchanged',
       (tester) async {
@@ -5417,35 +6213,26 @@ void main() {
       expect(find.text('Alice'), findsOneWidget);
       final createdAction = findRichText('created this channel');
       expect(createdAction, findsOneWidget);
-      expect(
-        tester.getSize(find.byType(CircleAvatar)),
-        const Size.square(messageAvatarSize),
-      );
-      final nameRect = tester.getRect(find.text('Alice'));
+      expect(find.byType(CircleAvatar), findsNothing);
       final nameText = tester.widget<Text>(find.text('Alice'));
-      expect(nameText.style?.fontSize, systemMessageHeadingTextStyle.fontSize);
-      expect(
-        nameText.style?.fontWeight,
-        systemMessageHeadingTextStyle.fontWeight,
-      );
+      expect(nameText.style?.fontSize, 14);
+      expect(nameText.style?.fontWeight, FontWeight.w400);
       expect(
         find.byKey(const ValueKey('system-message-username-alice')),
         findsNothing,
       );
-      final timestampRect = tester.getRect(
+      expect(
         find.byKey(const ValueKey('system-message-timestamp-alice')),
+        findsNothing,
       );
-      expect(timestampRect.left, greaterThan(nameRect.right));
       final createdText = tester.widget<RichText>(createdAction);
       expect(
         effectiveFontSizeForText(createdText.text, 'created this channel'),
-        systemMessageBodyTextStyle.fontSize,
+        14,
       );
     });
 
-    testWidgets('renders a huddle event like a regular message row', (
-      tester,
-    ) async {
+    testWidgets('renders a compact huddle activity row', (tester) async {
       await tester.pumpWidget(
         _buildTestable(
           messages: [_huddleMsg(id: 'huddle-1', kind: EventKind.huddleStarted)],
@@ -5458,13 +6245,10 @@ void main() {
 
       expect(find.text('Alice'), findsOneWidget);
       expect(findRichText('started a huddle'), findsOneWidget);
-      expect(
-        tester.getSize(find.byType(CircleAvatar)),
-        const Size.square(messageAvatarSize),
-      );
+      expect(find.byType(CircleAvatar), findsNothing);
       expect(
         find.byKey(const ValueKey('system-message-timestamp-alice')),
-        findsOneWidget,
+        findsNothing,
       );
     });
 
@@ -8281,7 +9065,7 @@ void main() {
       (kind: EventKind.huddleEnded, action: 'ended the huddle'),
     ]) {
       testWidgets(
-        '${huddleEvent.action} aligns its author and body with a regular message',
+        '${huddleEvent.action} retains its system layout beside bubble messages',
         (tester) async {
           await tester.pumpWidget(
             _buildTestable(
@@ -8321,34 +9105,23 @@ void main() {
                 .descendant(of: regularRow, matching: find.byType(CircleAvatar))
                 .first,
           );
-          final huddleAvatar = tester.getRect(
-            find
-                .descendant(of: huddleRow, matching: find.byType(CircleAvatar))
-                .first,
-          );
-          final regularAuthor = tester.getRect(
-            find.byKey(const ValueKey('message-author-regular-message')),
+          expect(
+            find.descendant(of: huddleRow, matching: find.byType(CircleAvatar)),
+            findsNothing,
           );
           final huddleAuthor = tester.getRect(
             find.byKey(const ValueKey('system-message-author-bob')),
           );
-          final regularBody = tester.getRect(findRichText('Regular message'));
           final huddleBody = tester.getRect(findRichText(huddleEvent.action));
-
-          expect(
-            huddleAuthor.top - huddleAvatar.top,
-            closeTo(regularAuthor.top - regularAvatar.top, 0.01),
-          );
-          expect(
-            huddleBody.top - huddleAuthor.bottom,
-            closeTo(regularBody.top - regularAuthor.bottom, 0.01),
-          );
+          expect(huddleAuthor.left, greaterThanOrEqualTo(huddleBody.left));
+          expect(huddleBody.top, greaterThan(regularAvatar.bottom));
+          expect(huddleAuthor.top, greaterThanOrEqualTo(huddleBody.top));
         },
       );
     }
 
     testWidgets(
-      'keeps membership and huddle rows evenly spaced with authored messages',
+      'keeps membership and huddle rows separated from bubble messages',
       (tester) async {
         await tester.pumpWidget(
           _buildTestable(
@@ -8395,29 +9168,26 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        Rect avatarRect(String rowKey) => tester.getRect(
-          find
-              .descendant(
-                of: find.byKey(ValueKey(rowKey)),
-                matching: find.byType(CircleAvatar),
-              )
-              .first,
-        );
-
-        final avatars = [
-          avatarRect('message-row-message-alice'),
-          avatarRect('message-row-message-bob'),
-          avatarRect('system-message-row-membership-carol'),
-          avatarRect('system-message-row-huddle-dave'),
-          avatarRect('message-row-message-erin'),
-        ];
-        final authoredMessageGap = avatars[1].top - avatars[0].bottom;
-
-        for (var index = 2; index < avatars.length; index++) {
+        final rows = [
+          'message-row-message-alice',
+          'message-row-message-bob',
+          'system-message-row-membership-carol',
+          'system-message-row-huddle-dave',
+          'message-row-message-erin',
+        ].map((key) => tester.getRect(find.byKey(ValueKey(key)))).toList();
+        for (var index = 1; index < rows.length; index++) {
+          expect(rows[index].top, greaterThanOrEqualTo(rows[index - 1].bottom));
+        }
+        for (final key in [
+          'system-message-row-membership-carol',
+          'system-message-row-huddle-dave',
+        ]) {
           expect(
-            avatars[index].top - avatars[index - 1].bottom,
-            closeTo(authoredMessageGap, 1),
-            reason: 'row $index should use the authored-message gap',
+            find.descendant(
+              of: find.byKey(ValueKey(key)),
+              matching: find.byType(CircleAvatar),
+            ),
+            findsNothing,
           );
         }
       },
@@ -8443,13 +9213,10 @@ void main() {
 
       expect(find.text('Bob'), findsOneWidget);
       expect(findRichText('joined the channel'), findsOneWidget);
-      expect(
-        tester.getSize(find.byType(CircleAvatar)),
-        const Size.square(messageAvatarSize),
-      );
+      expect(find.byType(CircleAvatar), findsNothing);
     });
 
-    testWidgets('opens a profile sheet from a membership system avatar', (
+    testWidgets('opens a profile sheet from a membership activity name', (
       tester,
     ) async {
       const alicePubkey =
@@ -8511,7 +9278,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byType(CircleAvatar));
+      await tester.tap(
+        find.byKey(const ValueKey('system-message-author-$bobPubkey')),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text('Copy public key'), findsOneWidget);
@@ -8556,7 +9325,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byType(CircleAvatar));
+      await tester.tap(
+        find.byKey(const ValueKey('system-message-author-$invalidPubkey')),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text('Copy public key'), findsOneWidget);
@@ -8646,7 +9417,9 @@ void main() {
           );
           await tester.pumpAndSettle();
 
-          await tester.tap(find.byType(CircleAvatar));
+          await tester.tap(
+            find.byKey(const ValueKey('system-message-author-$bobPubkey')),
+          );
           await tester.pumpAndSettle();
 
           expect(find.byType(UserProfileSheet), findsOneWidget);
@@ -8675,7 +9448,7 @@ void main() {
       },
     );
 
-    testWidgets('opens a profile sheet from a huddle system avatar', (
+    testWidgets('opens a profile sheet from a huddle activity name', (
       tester,
     ) async {
       await tester.pumpWidget(
@@ -8694,7 +9467,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byType(CircleAvatar));
+      await tester.tap(
+        find.byKey(const ValueKey('system-message-author-alice')),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text('Copy public key'), findsOneWidget);
@@ -8737,7 +9512,9 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        await tester.tap(find.byType(CircleAvatar));
+        await tester.tap(
+          find.byKey(const ValueKey('system-message-author-alice')),
+        );
         await tester.pumpAndSettle();
 
         expect(find.byType(UserProfileSheet), findsOneWidget);
@@ -8802,9 +9579,7 @@ void main() {
       },
     );
 
-    testWidgets('opens a profile sheet from a generic system avatar', (
-      tester,
-    ) async {
+    testWidgets('opens a profile sheet from an activity name', (tester) async {
       await tester.pumpWidget(
         _buildTestable(
           messages: [
@@ -8825,7 +9600,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byType(CircleAvatar).first);
+      await tester.tap(
+        find.byKey(const ValueKey('system-message-author-alice')),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text('Copy public key'), findsOneWidget);
@@ -8854,100 +9631,152 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Bob'), findsOneWidget);
-      final addedAction = findRichText('added by Alice');
+      final addedAction = findRichText('added ');
       expect(addedAction, findsOneWidget);
       expect(find.text('Alice added Bob to the channel'), findsNothing);
-      expect(
-        tester.getSize(find.byType(CircleAvatar)),
-        const Size.square(messageAvatarSize),
-      );
-      final nameRect = tester.getRect(find.text('Bob'));
+      expect(find.byType(CircleAvatar), findsNothing);
       expect(
         find.byKey(const ValueKey('system-message-username-bob')),
         findsNothing,
       );
-      final timestampRect = tester.getRect(
+      expect(
         find.byKey(const ValueKey('system-message-timestamp-bob')),
+        findsNothing,
       );
-      expect(timestampRect.left, greaterThan(nameRect.right));
-      final addedText = tester.widget<RichText>(addedAction);
+      final card = find.byKey(const ValueKey('activity-card-sys1'));
       expect(
-        effectiveFontSizeForText(addedText.text, 'added by Alice'),
-        systemMessageBodyTextStyle.fontSize,
+        find.descendant(of: card, matching: find.byType(Icon)),
+        findsNothing,
       );
-    });
-
-    testWidgets('groups member additions with tappable overflow names', (
-      tester,
-    ) async {
-      final messages = [
-        _systemMsg(
-          id: 'sys1',
-          payload: {'type': 'member_joined', 'actor': 'alice', 'target': 'bob'},
-          createdAt: 1000,
-        ),
-        _systemMsg(
-          id: 'sys2',
-          payload: {
-            'type': 'member_joined',
-            'actor': 'alice',
-            'target': 'carol',
-          },
-          createdAt: 1060,
-        ),
-        _systemMsg(
-          id: 'sys3',
-          payload: {
-            'type': 'member_joined',
-            'actor': 'alice',
-            'target': 'dave',
-          },
-          createdAt: 1120,
-        ),
-        _systemMsg(
-          id: 'sys4',
-          payload: {
-            'type': 'member_joined',
-            'actor': 'alice',
-            'target': 'erin',
-          },
-          createdAt: 1180,
-        ),
-        _systemMsg(
-          id: 'sys5',
-          payload: {
-            'type': 'member_joined',
-            'actor': 'alice',
-            'target': 'frank',
-          },
-          createdAt: 1240,
-        ),
-      ];
-
-      await tester.pumpWidget(
-        _buildTestable(
-          messages: messages,
-          users: {
-            'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
-            'bob': const UserProfile(pubkey: 'bob', displayName: 'Bob'),
-            'carol': const UserProfile(pubkey: 'carol', displayName: 'Carol'),
-            'dave': const UserProfile(pubkey: 'dave', displayName: 'Dave'),
-            'erin': const UserProfile(pubkey: 'erin', displayName: 'Erin'),
-            'frank': const UserProfile(pubkey: 'frank', displayName: 'Frank'),
-          },
-        ),
-      );
+      final actor = find.byKey(const ValueKey('system-message-author-alice'));
+      final target = find.byKey(const ValueKey('system-message-author-bob'));
+      expect(tester.getCenter(actor).dx, lessThan(tester.getCenter(target).dx));
+      expect(findRichText(' to the channel'), findsOneWidget);
+      await tester.tap(target);
       await tester.pumpAndSettle();
-
-      expect(find.text('Bob'), findsOneWidget);
-      expect(
-        findRichText('added by Alice, along with Carol, Dave, Erin, and '),
-        findsOneWidget,
-      );
-      expect(find.byKey(const Key('membership-overflow')), findsOneWidget);
-      expect(find.text('1 others'), findsOneWidget);
-      expect(find.byTooltip('Frank'), findsOneWidget);
+      expect(find.byType(UserProfileSheet), findsOneWidget);
+      Navigator.of(tester.element(find.byType(UserProfileSheet))).pop();
+      await tester.pumpAndSettle();
+      final addedText = tester.widget<RichText>(addedAction);
+      expect(effectiveFontSizeForText(addedText.text, 'added '), 14);
     });
+
+    for (final removal in [false, true]) {
+      testWidgets(
+        'limits activity names and opens all members, removal=$removal',
+        (tester) async {
+          final messages = [
+            _systemMsg(
+              id: 'sys1',
+              payload: {
+                'type': removal ? 'member_removed' : 'member_joined',
+                'actor': 'alice',
+                'target': 'bob',
+              },
+              createdAt: 1000,
+            ),
+            _systemMsg(
+              id: 'sys2',
+              payload: {
+                'type': removal ? 'member_removed' : 'member_joined',
+                'actor': 'alice',
+                'target': 'carol',
+              },
+              createdAt: 1060,
+            ),
+            _systemMsg(
+              id: 'sys3',
+              payload: {
+                'type': removal ? 'member_removed' : 'member_joined',
+                'actor': 'alice',
+                'target': 'dave',
+              },
+              createdAt: 1120,
+            ),
+            _systemMsg(
+              id: 'sys4',
+              payload: {
+                'type': removal ? 'member_removed' : 'member_joined',
+                'actor': 'alice',
+                'target': 'erin',
+              },
+              createdAt: 1180,
+            ),
+            _systemMsg(
+              id: 'sys5',
+              payload: {
+                'type': removal ? 'member_removed' : 'member_joined',
+                'actor': 'alice',
+                'target': 'frank',
+              },
+              createdAt: 1240,
+            ),
+          ];
+
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: messages,
+              users: {
+                'alice': const UserProfile(
+                  pubkey: 'alice',
+                  displayName: 'Alice',
+                ),
+                'bob': const UserProfile(pubkey: 'bob', displayName: 'Bob'),
+                'carol': const UserProfile(
+                  pubkey: 'carol',
+                  displayName: 'Carol',
+                ),
+                'dave': const UserProfile(pubkey: 'dave', displayName: 'Dave'),
+                'erin': const UserProfile(pubkey: 'erin', displayName: 'Erin'),
+                'frank': const UserProfile(
+                  pubkey: 'frank',
+                  displayName: 'Frank',
+                ),
+              },
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text('Bob'), findsOneWidget);
+          for (final pubkey in ['alice', 'bob', 'carol']) {
+            final name = find.byKey(ValueKey('system-message-author-$pubkey'));
+            expect(name, findsOneWidget);
+            expect(
+              tester.widget<Text>(name).style?.fontWeight,
+              FontWeight.w400,
+            );
+          }
+          expect(find.text('Dave'), findsNothing);
+          expect(find.text('Erin'), findsNothing);
+          expect(find.text('Frank'), findsNothing);
+          expect(findRichText('and 3 others'), findsOneWidget);
+          expect(
+            tester.widget<Text>(find.text('See all')).style?.fontWeight,
+            FontWeight.w600,
+          );
+          await tester.tap(find.text('See all'));
+          await tester.pumpAndSettle();
+          expect(
+            find.text(removal ? 'Removed members' : 'Added members'),
+            findsOneWidget,
+          );
+          for (final pubkey in ['bob', 'carol', 'dave', 'erin', 'frank']) {
+            final tile = find.byKey(ValueKey('activity-member-$pubkey'));
+            await tester.ensureVisible(tile);
+            await tester.tap(tile);
+            await tester.pumpAndSettle();
+            expect(
+              tester
+                  .widget<UserProfileSheet>(find.byType(UserProfileSheet))
+                  .pubkey,
+              pubkey,
+            );
+            await tester.tap(find.byTooltip('Close sheet').last);
+            await tester.pumpAndSettle();
+          }
+        },
+      );
+    }
 
     testWidgets('aligns grouped reactions with the system message content', (
       tester,
@@ -8982,11 +9811,12 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      final avatarRect = tester.getRect(find.byType(CircleAvatar));
-      final reactionRect = tester.getRect(find.byType(ReactionRow));
+      final card = tester.getRect(
+        find.byKey(const ValueKey('activity-card-sys1')),
+      );
       expect(
-        reactionRect.left,
-        avatarRect.left + messageAvatarSize + messageAvatarContentGap,
+        tester.getCenter(find.byType(ReactionRow)).dx,
+        closeTo(card.center.dx, 0.01),
       );
     });
 
@@ -9008,14 +9838,25 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.byKey(const ValueKey('add-reaction-pill')), findsOneWidget);
-
-      await tester.tap(find.byKey(const ValueKey('add-reaction-pill')));
+      expect(
+        find.byKey(const ValueKey('combined-reaction-tray')),
+        findsOneWidget,
+      );
+      await tester.tap(find.byKey(const ValueKey('combined-reaction-tray')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('reaction-sheet-add')));
       // Not pumpAndSettle: with no dataset asset in a widget test the sheet
       // shows its loading spinner, which animates forever.
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
       expect(find.byType(EmojiPickerSheet), findsOneWidget);
+      expect(
+        find.byKey(
+          const ValueKey('reaction-details-sheet'),
+          skipOffstage: false,
+        ),
+        findsNothing,
+      );
     });
 
     testWidgets('an unreacted message keeps the timeline free of chrome', (
@@ -9051,49 +9892,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('Bob left the channel'), findsOneWidget);
+      expect(find.text('Bob'), findsOneWidget);
+      expect(findRichText('left the channel'), findsOneWidget);
     });
-
-    testWidgets(
-      'constrains generic system timestamps at accessibility text sizes',
-      (tester) async {
-        tester.view.physicalSize = const Size(240, 600);
-        tester.view.devicePixelRatio = 1;
-        addTearDown(tester.view.resetPhysicalSize);
-        addTearDown(tester.view.resetDevicePixelRatio);
-
-        await tester.pumpWidget(
-          _buildTestable(
-            messages: [
-              _systemMsg(
-                id: 'sys-accessible',
-                payload: {'type': 'member_left', 'actor': 'alice'},
-                createdAt:
-                    DateTime(2026, 7, 28, 12, 34).millisecondsSinceEpoch ~/
-                    1000,
-              ),
-            ],
-            users: {
-              'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
-            },
-            textScaler: const TextScaler.linear(3),
-          ),
-        );
-        await tester.pumpAndSettle();
-
-        final timestampFinder = find.byKey(
-          const ValueKey('system-message-timestamp-sys-accessible'),
-        );
-        final timestamp = tester.widget<Text>(timestampFinder);
-        expect(timestamp.maxLines, 1);
-        expect(timestamp.overflow, TextOverflow.ellipsis);
-        expect(
-          tester.getSize(timestampFinder).width,
-          lessThanOrEqualTo(Grid.xxl),
-        );
-        expect(tester.takeException(), isNull);
-      },
-    );
 
     testWidgets('renders member_removed system event', (tester) async {
       final messages = [
@@ -9120,7 +9921,10 @@ void main() {
 
       expect(find.text('Alice'), findsOneWidget);
       expect(findRichText('removed '), findsOneWidget);
-      expect(find.widgetWithText(MessageMentionPill, 'Bob'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('system-message-author-bob')),
+        findsOneWidget,
+      );
     });
 
     testWidgets('renders topic_changed system event', (tester) async {
@@ -9147,34 +9951,6 @@ void main() {
 
       expect(
         findRichText('changed the topic to "Release planning"'),
-        findsOneWidget,
-      );
-    });
-
-    testWidgets('renders purpose_changed system event', (tester) async {
-      final messages = [
-        _systemMsg(
-          id: 'sys1',
-          payload: {
-            'type': 'purpose_changed',
-            'actor': 'alice',
-            'purpose': 'Team standup notes',
-          },
-        ),
-      ];
-
-      await tester.pumpWidget(
-        _buildTestable(
-          messages: messages,
-          users: {
-            'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
-          },
-        ),
-      );
-      await tester.pumpAndSettle();
-
-      expect(
-        findRichText('changed the purpose to "Team standup notes"'),
         findsOneWidget,
       );
     });
@@ -10577,7 +11353,7 @@ void main() {
       tester,
     ) async {
       final root = _textMsg(
-        id: 'local-root',
+        id: threadIdLocalDashRoot,
         pubkey: 'alice',
         content: 'Start a local thread',
       );
@@ -10587,7 +11363,7 @@ void main() {
         content: 'Waiting for relay echo',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'local-root', '', 'reply'],
+          ['e', threadIdLocalDashRoot, '', 'reply'],
         ],
       );
       final query = Completer<List<NostrEvent>>();
@@ -10596,7 +11372,7 @@ void main() {
         _buildTestable(
           messages: [root],
           messagesNotifier: notifier,
-          pendingThreadReplies: {'local-root': query.future},
+          pendingThreadReplies: {threadIdLocalDashRoot: query.future},
         ),
       );
       await tester.pumpAndSettle();
@@ -10726,7 +11502,7 @@ void main() {
         'cold broadcast row with $directReplies relay-only direct replies',
         (tester) async {
           final root = _textMsg(
-            id: 'outer-root',
+            id: threadIdOuterDashRoot,
             pubkey: 'bob',
             content: 'Outer root',
           );
@@ -10735,8 +11511,8 @@ void main() {
             pubkey: 'alice',
             content: 'Broadcast reply with unloaded children',
             extraTags: const [
-              ['e', 'outer-root', '', 'root'],
-              ['e', 'outer-root', '', 'reply'],
+              ['e', threadIdOuterDashRoot, '', 'root'],
+              ['e', threadIdOuterDashRoot, '', 'reply'],
               ['broadcast', '1'],
             ],
           );
@@ -10777,7 +11553,7 @@ void main() {
             : 'tapping a message without replies stays in the channel',
         (tester) async {
           final root = _textMsg(
-            id: 'tap-root',
+            id: threadIdTapDashRoot,
             pubkey: 'alice',
             content: 'Tap this message',
           );
@@ -10789,14 +11565,14 @@ void main() {
                 content: 'A reply',
                 createdAt: 1100,
                 extraTags: const [
-                  ['e', 'tap-root', '', 'reply'],
+                  ['e', threadIdTapDashRoot, '', 'reply'],
                 ],
               ),
           ];
           await tester.pumpWidget(
             _buildTestable(
               messages: [root, ...replies],
-              threadReplies: {'tap-root': replies},
+              threadReplies: {threadIdTapDashRoot: replies},
             ),
           );
           await tester.pumpAndSettle();
@@ -10825,7 +11601,7 @@ void main() {
       tester,
     ) async {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -10836,7 +11612,7 @@ void main() {
         content: 'Target reply',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'root', '', 'reply'],
+          ['e', threadIdRoot, '', 'reply'],
         ],
       );
       final timelineMessages = formatTimeline([root, target]);
@@ -10848,7 +11624,7 @@ void main() {
         _buildTestable(
           messages: [root, target],
           threadReplies: {
-            'root': [target],
+            threadIdRoot: [target],
           },
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -10937,7 +11713,7 @@ void main() {
       tester,
     ) async {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -10950,7 +11726,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'root', '', 'reply'],
+              ['e', threadIdRoot, '', 'reply'],
             ],
           ),
       ];
@@ -10961,7 +11737,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [root],
-          pendingThreadReplies: {'root': replyCompleter.future},
+          pendingThreadReplies: {threadIdRoot: replyCompleter.future},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -11027,7 +11803,7 @@ void main() {
       tester,
     ) async {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -11038,7 +11814,7 @@ void main() {
         content: 'Hydrated target',
         createdAt: 1400,
         extraTags: const [
-          ['e', 'root', '', 'reply'],
+          ['e', threadIdRoot, '', 'reply'],
         ],
       );
       final earlierReplies = [
@@ -11049,7 +11825,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'root', '', 'reply'],
+              ['e', threadIdRoot, '', 'reply'],
             ],
           ),
       ];
@@ -11063,10 +11839,10 @@ void main() {
           providerRetry: (retryCount, _) =>
               retryCount == 0 ? const Duration(seconds: 30) : null,
           localThreadReplies: {
-            'root': [target],
+            threadIdRoot: [target],
           },
           threadReplyLoaders: {
-            'root': () {
+            threadIdRoot: () {
               attempts++;
               if (attempts == 1) return firstAttempt.future;
               return Future.value([...earlierReplies, target]);
@@ -11138,7 +11914,7 @@ void main() {
       tester,
     ) async {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -11149,7 +11925,7 @@ void main() {
         content: 'Hydrated target',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'root', '', 'reply'],
+          ['e', threadIdRoot, '', 'reply'],
         ],
       );
       final timelineMessages = formatTimeline([root, target]);
@@ -11158,7 +11934,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [root, target],
-          pendingThreadReplies: {'root': replyCompleter.future},
+          pendingThreadReplies: {threadIdRoot: replyCompleter.future},
           disableRetries: true,
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -11198,18 +11974,18 @@ void main() {
 
     group('after a first-load deadline', () {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
       );
       final mid = _textMsg(
-        id: 'mid',
+        id: threadIdMid,
         pubkey: 'bob',
         content: 'Nested parent',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'root', '', 'reply'],
+          ['e', threadIdRoot, '', 'reply'],
         ],
       );
 
@@ -11226,7 +12002,7 @@ void main() {
             messagesNotifier: messages,
             disableRetries: true,
             threadReplyLoaders: {
-              'root': () {
+              threadIdRoot: () {
                 attempts++;
                 return Future.error(
                   RelayException(503, '{"error":"query timed out"}'),
@@ -11262,7 +12038,7 @@ void main() {
           root,
           mid,
           liveReply('direct', const [
-            ['e', 'root', '', 'reply'],
+            ['e', threadIdRoot, '', 'reply'],
           ]),
         ]);
         await tester.pumpAndSettle();
@@ -11288,7 +12064,7 @@ void main() {
                 messagesNotifier: messages,
                 disableRetries: true,
                 threadReplyLoaders: {
-                  'root': () {
+                  threadIdRoot: () {
                     loads++;
                     if (!fail) return Future.value(const <NostrEvent>[]);
                     return Future.error(
@@ -11297,7 +12073,7 @@ void main() {
                   },
                 },
                 home: ThreadDetailPage(
-                  threadHead: timeline.firstWhere((m) => m.id == 'root'),
+                  threadHead: timeline.firstWhere((m) => m.id == threadIdRoot),
                   allMessages: timeline,
                   channelId: _testChannel.id,
                   currentPubkey: 'me',
@@ -11313,7 +12089,7 @@ void main() {
                 root,
                 mid,
                 liveReply('direct', const [
-                  ['e', 'root', '', 'reply'],
+                  ['e', threadIdRoot, '', 'reply'],
                 ]),
               ]);
               await tester.pumpAndSettle();
@@ -11347,10 +12123,10 @@ void main() {
           _buildTestable(
             messages: [root, mid],
             threadReplyLoaders: {
-              'root': () => Completer<List<NostrEvent>>().future,
+              threadIdRoot: () => Completer<List<NostrEvent>>().future,
             },
             home: ThreadDetailPage(
-              threadHead: timeline.firstWhere((m) => m.id == 'root'),
+              threadHead: timeline.firstWhere((m) => m.id == threadIdRoot),
               allMessages: timeline,
               channelId: _testChannel.id,
               currentPubkey: 'me',
@@ -11374,8 +12150,8 @@ void main() {
           root,
           mid,
           liveReply('nested', const [
-            ['e', 'root', '', 'root'],
-            ['e', 'mid', '', 'reply'],
+            ['e', threadIdRoot, '', 'root'],
+            ['e', threadIdMid, '', 'reply'],
           ]),
         ]);
         await tester.pumpAndSettle();
@@ -11393,13 +12169,16 @@ void main() {
           content: 'My reply',
           createdAt: 1300,
           extraTags: const [
-            ['e', 'root', '', 'reply'],
+            ['e', threadIdRoot, '', 'reply'],
           ],
         );
         final container = ProviderScope.containerOf(
           tester.element(find.byType(ThreadDetailPage)),
         );
-        const args = ThreadRepliesArgs(channelId: _channelId, rootId: 'root');
+        const args = ThreadRepliesArgs(
+          channelId: _channelId,
+          rootId: threadIdRoot,
+        );
         container.read(threadLocalRepliesProvider(args).notifier).add(sent);
         await tester.pumpAndSettle();
         expect(find.text('My reply'), findsOneWidget);
@@ -11415,22 +12194,116 @@ void main() {
       });
     });
 
+    for (final variant in ['valid', 'uppercase', 'trailing malformed']) {
+      String marker(String id) =>
+          variant == 'uppercase' ? id.toUpperCase() : id;
+      testWidgets(
+        'push tap highlights its exact reply after newer arrivals: $variant',
+        (tester) async {
+          pendingPushNotificationLink.value = null;
+          installBuzzPushMethodHandler();
+          addTearDown(() {
+            pendingPushNotificationLink.value = null;
+          });
+          const channel = MethodChannel('buzz/push');
+          await TestDefaultBinaryMessengerBinding
+              .instance
+              .defaultBinaryMessenger
+              .handlePlatformMessage(
+                channel.name,
+                channel.codec.encodeMethodCall(
+                  const MethodCall('notificationOpened', {
+                    'eventId': 'target',
+                    'communityId': 'community',
+                    'channelId': _channelId,
+                    'threadRootId': threadIdParent,
+                  }),
+                ),
+                (_) {},
+              );
+          final link = pendingPushNotificationLink.value!;
+          final root = _textMsg(
+            id: threadIdRoot,
+            pubkey: 'alice',
+            content: 'Outer root',
+            createdAt: 1000,
+          );
+          final parent = _textMsg(
+            id: threadIdParent,
+            pubkey: 'alice',
+            content: 'Containing thread',
+            createdAt: 1100,
+            extraTags: [
+              ['e', marker(threadIdRoot), '', 'reply'],
+            ],
+          );
+          final target = _textMsg(
+            id: 'target',
+            pubkey: 'alice',
+            content: 'Notification reply',
+            createdAt: 1200,
+            extraTags: [
+              ['e', marker(threadIdRoot), '', 'root'],
+              ['e', marker(threadIdParent), '', 'reply'],
+              if (variant == 'trailing malformed') ['e', 'bad', '', 'reply'],
+            ],
+          );
+          final newer = _textMsg(
+            id: 'newer',
+            pubkey: 'alice',
+            content: 'Newer reply',
+            createdAt: 1300,
+            extraTags: [
+              ['e', marker(threadIdRoot), '', 'root'],
+              ['e', marker(threadIdParent), '', 'reply'],
+              if (variant == 'trailing malformed') ['e', 'bad', '', 'reply'],
+            ],
+          );
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: [root, parent, target, newer],
+              initialMessageId: link.messageId,
+              initialThreadRootId: link.threadRootId,
+              threadReplies: {
+                threadIdRoot: [parent, target, newer],
+              },
+            ),
+          );
+          await tester.pumpAndSettle();
+          final page = tester.widget<ThreadDetailPage>(
+            find.byType(ThreadDetailPage),
+          );
+          expect(page.threadHead.id, threadIdParent);
+          expect(page.initialMessageId, 'target');
+          final decoration =
+              tester
+                      .widget<DecoratedBox>(
+                        find.byKey(const ValueKey('thread-message-target')),
+                      )
+                      .decoration
+                  as BoxDecoration;
+          expect(decoration.color!.a, closeTo(0.12, 0.001));
+          expect(find.text('Newer reply'), findsOneWidget);
+        },
+      );
+    }
+
     testWidgets('opens a nested reply in its direct-parent thread', (
       tester,
     ) async {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Outer root',
         createdAt: 1000,
       );
       final parent = _textMsg(
-        id: 'parent',
+        id: threadIdParent,
         pubkey: 'bob',
         content: 'Nested thread head',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'root', '', 'reply'],
+          ['e', threadIdRoot, '', 'reply'],
         ],
       );
       final target = _textMsg(
@@ -11439,8 +12312,8 @@ void main() {
         content: 'Deeply nested target',
         createdAt: 1200,
         extraTags: const [
-          ['e', 'root', '', 'root'],
-          ['e', 'parent', '', 'reply'],
+          ['e', threadIdRoot, '', 'root'],
+          ['e', threadIdParent, '', 'reply'],
         ],
       );
 
@@ -11448,11 +12321,11 @@ void main() {
         _buildTestable(
           messages: [root, parent, target],
           initialMessageId: 'target',
-          initialThreadRootId: 'parent',
+          initialThreadRootId: threadIdParent,
           threadReplies: {
             // Relay subtree filtering is keyed by thread_metadata.root_event_id,
             // so nested replies are returned by the outer-root query.
-            'root': [parent, target],
+            threadIdRoot: [parent, target],
           },
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -11466,7 +12339,7 @@ void main() {
       final threadPage = tester.widget<ThreadDetailPage>(
         find.byType(ThreadDetailPage),
       );
-      expect(threadPage.threadHead.id, 'parent');
+      expect(threadPage.threadHead.id, threadIdParent);
       expect(threadPage.initialMessageId, 'target');
 
       final highlighted = tester.widget<DecoratedBox>(
@@ -11515,7 +12388,7 @@ void main() {
       tester,
     ) async {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Thread root',
       );
@@ -11525,7 +12398,7 @@ void main() {
         _buildTestable(
           messages: const [],
           messagesNotifier: messagesNotifier,
-          initialThreadRootId: 'root',
+          initialThreadRootId: threadIdRoot,
           initialThreadRouteBehavior:
               InitialThreadRouteBehavior.replaceCurrentRoute,
         ),
@@ -11551,7 +12424,7 @@ void main() {
       tester,
     ) async {
       final root = _textMsg(
-        id: 'root',
+        id: threadIdRoot,
         pubkey: 'alice',
         content: 'Thread root',
       );
@@ -11561,7 +12434,7 @@ void main() {
         content: 'Target reply',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'root', '', 'reply'],
+          ['e', threadIdRoot, '', 'reply'],
         ],
       );
       final relaySession = _TrackingRelaySession();
@@ -11571,7 +12444,7 @@ void main() {
           messages: [root, target],
           relaySessionNotifier: relaySession,
           threadReplies: {
-            'root': [target],
+            threadIdRoot: [target],
           },
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -11586,7 +12459,7 @@ void main() {
                       builder: (_) => ChannelDetailPage(
                         channel: _testChannel,
                         initialMessageId: 'target',
-                        initialThreadRootId: 'root',
+                        initialThreadRootId: threadIdRoot,
                         initialThreadRouteBehavior:
                             InitialThreadRouteBehavior.replaceCurrentRoute,
                       ),
@@ -11742,7 +12615,7 @@ void main() {
       final nextDayCreatedAt =
           DateTime(2025, 1, 2, 12).toUtc().millisecondsSinceEpoch ~/ 1000;
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: rootCreatedAt,
@@ -11754,7 +12627,7 @@ void main() {
           content: 'Same day',
           createdAt: rootCreatedAt + 60,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         ),
         _textMsg(
@@ -11763,7 +12636,7 @@ void main() {
           content: 'Next day',
           createdAt: nextDayCreatedAt,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         ),
       ];
@@ -11771,7 +12644,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
           users: {
             'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': const UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -11829,7 +12702,9 @@ void main() {
       // composer, matching desktop's thread panel.
       final headY = tester
           .getTopLeft(
-            find.byKey(const ValueKey('thread-message-group-thread-root')),
+            find.byKey(
+              const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
+            ),
           )
           .dy;
       final oldestReplyY = tester
@@ -11845,15 +12720,16 @@ void main() {
       expect(headY, lessThan(oldestReplyY));
       expect(oldestReplyY, lessThan(newestReplyY));
       final threadTimestamp = tester.widget<Text>(
-        find.byKey(const ValueKey('thread-message-timestamp-thread-root')),
+        find.byKey(
+          const ValueKey('thread-message-timestamp-$threadIdThreadDashRoot'),
+        ),
       );
-      expect(
-        threadTimestamp.style?.fontSize,
-        messageTimestampTextStyle.fontSize,
-      );
+      expect(threadTimestamp.style?.fontSize, 11);
       expect(
         find.descendant(
-          of: find.byKey(const ValueKey('thread-message-row-thread-root')),
+          of: find.byKey(
+            const ValueKey('thread-message-row-$threadIdThreadDashRoot'),
+          ),
           matching: find.text('·'),
         ),
         findsNothing,
@@ -11872,7 +12748,7 @@ void main() {
           DateTime(2025, 1, day, 12, minute).toUtc().millisecondsSinceEpoch ~/
           1000;
       final rootEvent = _textMsg(
-        id: 'sticky-thread-root',
+        id: threadIdStickyDashThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: timestampForDay(1, 0),
@@ -11885,7 +12761,7 @@ void main() {
             content: 'Reply $i',
             createdAt: timestampForDay(1 + (i ~/ 30), i % 30),
             extraTags: const [
-              ['e', 'sticky-thread-root', '', 'reply'],
+              ['e', threadIdStickyDashThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -11893,7 +12769,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: {'sticky-thread-root': replies},
+          threadReplies: {threadIdStickyDashThreadDashRoot: replies},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -11981,7 +12857,7 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
 
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -11994,7 +12870,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -12002,7 +12878,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12088,7 +12964,7 @@ void main() {
       addTearDown(tester.view.reset);
 
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'A short thread',
         createdAt: 1000,
@@ -12097,7 +12973,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: const {'thread-root': []},
+          threadReplies: const {threadIdThreadDashRoot: []},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
           },
@@ -12121,7 +12997,7 @@ void main() {
       await tester.pumpAndSettle();
 
       final head = find.byKey(
-        const ValueKey('thread-message-group-thread-root'),
+        const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
       );
       final initialHeadY = tester.getTopLeft(head).dy;
       expect(initialHeadY, lessThan(300));
@@ -12150,7 +13026,7 @@ void main() {
         addTearDown(tester.view.reset);
         try {
           final rootEvent = _textMsg(
-            id: 'thread-root',
+            id: threadIdThreadDashRoot,
             pubkey: 'alice',
             content: 'A short thread',
             createdAt: 1000,
@@ -12163,7 +13039,7 @@ void main() {
                 content: i.isEven ? 'hello' : 'testing',
                 createdAt: 1100 + i,
                 extraTags: const [
-                  ['e', 'thread-root', '', 'reply'],
+                  ['e', threadIdThreadDashRoot, '', 'reply'],
                 ],
               ),
           ];
@@ -12171,7 +13047,7 @@ void main() {
           await tester.pumpWidget(
             _buildTestable(
               messages: [rootEvent],
-              threadReplies: {'thread-root': replies},
+              threadReplies: {threadIdThreadDashRoot: replies},
               users: const {
                 'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
                 'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12238,7 +13114,7 @@ void main() {
           tester.view.devicePixelRatio = 1;
           addTearDown(tester.view.reset);
           final rootEvent = _textMsg(
-            id: 'thread-root',
+            id: threadIdThreadDashRoot,
             pubkey: 'alice',
             content: 'Short root',
             createdAt: 1000,
@@ -12251,14 +13127,14 @@ void main() {
                 content: 'Short reply',
                 createdAt: 1100,
                 extraTags: const [
-                  ['e', 'thread-root', '', 'reply'],
+                  ['e', threadIdThreadDashRoot, '', 'reply'],
                 ],
               ),
           ];
           await tester.pumpWidget(
             _buildTestable(
               messages: [rootEvent],
-              threadReplies: {'thread-root': replies},
+              threadReplies: {threadIdThreadDashRoot: replies},
               users: const {
                 'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
                 'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12297,7 +13173,7 @@ void main() {
           final tail = find.byKey(
             ValueKey(
               replyCount == 0
-                  ? 'thread-message-group-thread-root'
+                  ? 'thread-message-group-$threadIdThreadDashRoot'
                   : 'thread-message-group-reply-0',
             ),
           );
@@ -12322,7 +13198,7 @@ void main() {
         addTearDown(tester.view.reset);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -12333,11 +13209,11 @@ void main() {
               id: 'reply-$i',
               pubkey: 'bob',
               content: i == 29
-                  ? List.filled(33, 'Tall latest reply').join('\n')
+                  ? List.filled(31, 'Tall latest reply').join('\n')
                   : 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -12345,7 +13221,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12389,7 +13265,7 @@ void main() {
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -12402,7 +13278,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -12410,7 +13286,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12452,7 +13328,7 @@ void main() {
         addTearDown(tester.view.reset);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -12465,7 +13341,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -12474,7 +13350,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            pendingThreadReplies: {'thread-root': completer.future},
+            pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12516,7 +13392,7 @@ void main() {
           findsNothing,
         );
 
-        for (var i = 0; i < 12; i++) {
+        for (var i = 0; i < 20; i++) {
           await tester.drag(list, const Offset(0, -100));
           await tester.pumpAndSettle();
         }
@@ -12543,7 +13419,7 @@ void main() {
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -12556,7 +13432,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -12565,7 +13441,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          pendingThreadReplies: {'thread-root': completer.future},
+          pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12591,7 +13467,7 @@ void main() {
       await tester.pumpAndSettle();
 
       final anchor = find.byKey(
-        const ValueKey('thread-message-group-thread-root'),
+        const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
       );
       final anchorTop = tester.getTopLeft(anchor).dy;
       completer.complete(replies);
@@ -12612,7 +13488,7 @@ void main() {
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -12625,7 +13501,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -12634,7 +13510,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          pendingThreadReplies: {'thread-root': completer.future},
+          pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12659,7 +13535,7 @@ void main() {
       await tester.pumpAndSettle();
 
       final anchor = find.byKey(
-        const ValueKey('thread-message-group-thread-root'),
+        const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
       );
       final anchorTop = tester.getTopLeft(anchor).dy;
       completer.complete(replies);
@@ -12688,7 +13564,7 @@ void main() {
         addTearDown(tester.view.reset);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -12699,11 +13575,11 @@ void main() {
               id: 'reply-$i',
               pubkey: 'bob',
               content: i == 29
-                  ? List.filled(15, 'Tall latest reply').join('\n')
+                  ? List.filled(14, 'Tall latest reply').join('\n')
                   : 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -12712,7 +13588,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            pendingThreadReplies: {'thread-root': completer.future},
+            pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12776,7 +13652,7 @@ void main() {
       debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
       try {
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -12788,7 +13664,7 @@ void main() {
             content: 'First reply',
             createdAt: 1100,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
           _textMsg(
@@ -12797,7 +13673,7 @@ void main() {
             content: 'Second reply',
             createdAt: 1101,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
         ];
@@ -12806,7 +13682,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            pendingThreadReplies: {'thread-root': completer.future},
+            pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12831,7 +13707,7 @@ void main() {
         await tester.pumpAndSettle();
 
         final headFinder = find.byKey(
-          const ValueKey('thread-message-group-thread-root'),
+          const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
         );
         final initialHeadY = tester.getTopLeft(headFinder).dy;
         const latestButton = ValueKey('thread-jump-to-latest');
@@ -12866,7 +13742,7 @@ void main() {
       'slow initial hydration requests the frame that settles the latest reply',
       (tester) async {
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -12879,7 +13755,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -12888,7 +13764,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            pendingThreadReplies: {'thread-root': completer.future},
+            pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12919,7 +13795,9 @@ void main() {
 
         expect(
           find
-              .byKey(const ValueKey('thread-message-group-thread-root'))
+              .byKey(
+                const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
+              )
               .hitTestable(),
           findsNothing,
         );
@@ -12934,7 +13812,7 @@ void main() {
       'initial thread hydration settles on the latest reply after pagination',
       (tester) async {
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -12947,7 +13825,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -12958,7 +13836,7 @@ void main() {
           _buildTestable(
             messages: [rootEvent],
             messagesNotifier: messagesNotifier,
-            pendingThreadReplies: {'thread-root': completer.future},
+            pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -12982,7 +13860,9 @@ void main() {
         );
         await tester.pumpAndSettle();
         expect(
-          find.byKey(const ValueKey('thread-message-group-thread-root')),
+          find.byKey(
+            const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
+          ),
           findsOneWidget,
         );
         expect(
@@ -12998,7 +13878,7 @@ void main() {
           content: List.filled(10, 'Tall live reply').join('\n'),
           createdAt: 1200,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         );
         messagesNotifier.setMessages([rootEvent, latestLiveReply]);
@@ -13006,7 +13886,9 @@ void main() {
 
         expect(
           find
-              .byKey(const ValueKey('thread-message-group-thread-root'))
+              .byKey(
+                const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
+              )
               .hitTestable(),
           findsNothing,
         );
@@ -13033,7 +13915,7 @@ void main() {
       'active primary drag rejects queued remote and local reply tail work',
       (tester) async {
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Root',
           createdAt: 1000,
@@ -13046,7 +13928,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -13055,7 +13937,7 @@ void main() {
           _buildTestable(
             messages: [rootEvent],
             messagesNotifier: messagesNotifier,
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
           ),
         );
         await tester.pumpAndSettle();
@@ -13087,7 +13969,7 @@ void main() {
           content: 'Remote',
           createdAt: 1200,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         );
         messagesNotifier.setMessages([rootEvent, remoteReply]);
@@ -13099,7 +13981,7 @@ void main() {
           content: 'Local',
           createdAt: 1201,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         );
         messagesNotifier.setMessages([rootEvent, remoteReply, localReply]);
@@ -13113,7 +13995,7 @@ void main() {
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Root',
         createdAt: 1000,
@@ -13126,7 +14008,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -13135,7 +14017,7 @@ void main() {
         _buildTestable(
           messages: [rootEvent],
           messagesNotifier: messagesNotifier,
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
         ),
       );
       await tester.pumpAndSettle();
@@ -13164,7 +14046,7 @@ void main() {
         content: 'Local',
         createdAt: 1200,
         extraTags: const [
-          ['e', 'thread-root', '', 'reply'],
+          ['e', threadIdThreadDashRoot, '', 'reply'],
         ],
       );
       messagesNotifier.setMessages([rootEvent, localReply]);
@@ -13182,7 +14064,7 @@ void main() {
             content: List.filled(8, 'Tall remote reply $i').join('\n'),
             createdAt: 1300 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -13205,7 +14087,7 @@ void main() {
         tester.view.devicePixelRatio = 1;
         addTearDown(tester.view.reset);
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Root',
           createdAt: 1000,
@@ -13218,7 +14100,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -13226,7 +14108,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
           ),
         );
         await tester.pumpAndSettle();
@@ -13246,7 +14128,7 @@ void main() {
         await tester.pumpAndSettle();
 
         final head = find.byKey(
-          const ValueKey('thread-message-group-thread-root'),
+          const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
         );
         final latest = find.byKey(
           const ValueKey('thread-message-group-reply-2'),
@@ -13277,7 +14159,7 @@ void main() {
             tester.view.devicePixelRatio = 1;
             addTearDown(tester.view.reset);
             final rootEvent = _textMsg(
-              id: 'thread-root',
+              id: threadIdThreadDashRoot,
               pubkey: 'alice',
               content: 'Root',
               createdAt: 1000,
@@ -13293,7 +14175,7 @@ void main() {
                       : 'Reply $i',
                   createdAt: 1100 + i,
                   extraTags: const [
-                    ['e', 'thread-root', '', 'reply'],
+                    ['e', threadIdThreadDashRoot, '', 'reply'],
                   ],
                 ),
             ];
@@ -13302,7 +14184,7 @@ void main() {
               _buildTestable(
                 messages: [rootEvent],
                 typingNotifier: typingNotifier,
-                threadReplies: {'thread-root': replies},
+                threadReplies: {threadIdThreadDashRoot: replies},
                 disableAnimations: true,
               ),
             );
@@ -13325,7 +14207,7 @@ void main() {
               ValueKey('thread-message-group-reply-${replyCount - 1}'),
             );
             final head = find.byKey(
-              const ValueKey('thread-message-group-thread-root'),
+              const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
             );
             final initialHeadTop = tail.isLong
                 ? null
@@ -13350,7 +14232,7 @@ void main() {
             typingNotifier.setEntries(const [
               TypingEntry(
                 pubkey: 'bob',
-                threadHeadId: 'thread-root',
+                threadHeadId: threadIdThreadDashRoot,
                 expiresAtMs: 9999999999999,
               ),
             ]);
@@ -13380,7 +14262,7 @@ void main() {
           tester.view.devicePixelRatio = 1;
           addTearDown(tester.view.reset);
           final rootEvent = _textMsg(
-            id: 'thread-root',
+            id: threadIdThreadDashRoot,
             pubkey: 'alice',
             content: 'Root',
             createdAt: 1000,
@@ -13393,7 +14275,7 @@ void main() {
                 content: 'Reply $i',
                 createdAt: 1100 + i,
                 extraTags: const [
-                  ['e', 'thread-root', '', 'reply'],
+                  ['e', threadIdThreadDashRoot, '', 'reply'],
                 ],
               ),
           ];
@@ -13402,7 +14284,7 @@ void main() {
             _buildTestable(
               messages: [rootEvent],
               typingNotifier: typingNotifier,
-              threadReplies: {'thread-root': replies},
+              threadReplies: {threadIdThreadDashRoot: replies},
               disableAnimations: true,
             ),
           );
@@ -13440,7 +14322,7 @@ void main() {
           typingNotifier.setEntries(const [
             TypingEntry(
               pubkey: 'bob',
-              threadHeadId: 'thread-root',
+              threadHeadId: threadIdThreadDashRoot,
               expiresAtMs: 9999999999999,
             ),
           ]);
@@ -13461,7 +14343,7 @@ void main() {
         tester,
       ) async {
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -13474,7 +14356,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -13483,7 +14365,7 @@ void main() {
           _buildTestable(
             messages: [rootEvent],
             messagesNotifier: messagesNotifier,
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
           ),
         );
         await tester.pumpAndSettle();
@@ -13516,7 +14398,7 @@ void main() {
             content: 'Remote tail',
             createdAt: 9999,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
         ]);
@@ -13537,7 +14419,7 @@ void main() {
         addTearDown(tester.view.reset);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -13550,7 +14432,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -13559,7 +14441,7 @@ void main() {
           _buildTestable(
             messages: [rootEvent],
             messagesNotifier: messagesNotifier,
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
           ),
         );
         await tester.pumpAndSettle();
@@ -13623,7 +14505,7 @@ void main() {
             content: 'Remote tail',
             createdAt: 9999,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
         ]);
@@ -13654,7 +14536,7 @@ void main() {
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -13667,7 +14549,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -13676,7 +14558,7 @@ void main() {
         _buildTestable(
           messages: [rootEvent],
           messagesNotifier: messagesNotifier,
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
         ),
       );
       await tester.pumpAndSettle();
@@ -13720,7 +14602,7 @@ void main() {
           content: 'Remote tail',
           createdAt: 9999,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         ),
       ]);
@@ -13733,7 +14615,7 @@ void main() {
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -13746,7 +14628,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -13755,7 +14637,7 @@ void main() {
         _buildTestable(
           messages: [rootEvent],
           messagesNotifier: messagesNotifier,
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
         ),
       );
       await tester.pumpAndSettle();
@@ -13798,7 +14680,7 @@ void main() {
           content: 'Remote tail',
           createdAt: 9999,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         ),
       ]);
@@ -13818,7 +14700,7 @@ void main() {
         addTearDown(tester.view.reset);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -13831,7 +14713,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -13839,7 +14721,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -13942,7 +14824,7 @@ void main() {
         addTearDown(tester.view.reset);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -13955,7 +14837,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -13964,7 +14846,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            pendingThreadReplies: {'thread-root': completer.future},
+            pendingThreadReplies: {threadIdThreadDashRoot: completer.future},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14033,7 +14915,7 @@ void main() {
       addTearDown(tester.view.reset);
 
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -14046,7 +14928,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -14054,7 +14936,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14156,7 +15038,7 @@ void main() {
           addTearDown(tester.view.reset);
 
           final rootEvent = _textMsg(
-            id: 'thread-root',
+            id: threadIdThreadDashRoot,
             pubkey: 'alice',
             content: 'Thread root',
             createdAt: 1000,
@@ -14169,7 +15051,7 @@ void main() {
                 content: 'Reply $i',
                 createdAt: 1100 + i,
                 extraTags: const [
-                  ['e', 'thread-root', '', 'reply'],
+                  ['e', threadIdThreadDashRoot, '', 'reply'],
                 ],
               ),
           ];
@@ -14177,7 +15059,7 @@ void main() {
           await tester.pumpWidget(
             _buildTestable(
               messages: [rootEvent],
-              threadReplies: {'thread-root': replies},
+              threadReplies: {threadIdThreadDashRoot: replies},
               users: const {
                 'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
                 'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14247,7 +15129,7 @@ void main() {
         addTearDown(tester.view.reset);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -14260,7 +15142,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -14268,7 +15150,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14323,7 +15205,7 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
 
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -14336,7 +15218,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -14344,7 +15226,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14404,7 +15286,7 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
 
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -14417,7 +15299,7 @@ void main() {
             content: 'Reply $i',
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -14426,8 +15308,10 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          pendingThreadReplies: {'thread-root': authoritativeReplies.future},
-          localThreadReplies: {'thread-root': replies},
+          pendingThreadReplies: {
+            threadIdThreadDashRoot: authoritativeReplies.future,
+          },
+          localThreadReplies: {threadIdThreadDashRoot: replies},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14529,7 +15413,7 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
 
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -14548,7 +15432,7 @@ void main() {
             ].join('\n'),
             createdAt: 1100 + i,
             extraTags: const [
-              ['e', 'thread-root', '', 'reply'],
+              ['e', threadIdThreadDashRoot, '', 'reply'],
             ],
           ),
       ];
@@ -14556,7 +15440,7 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: [rootEvent],
-          threadReplies: {'thread-root': replies},
+          threadReplies: {threadIdThreadDashRoot: replies},
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
             'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14622,7 +15506,7 @@ void main() {
         addTearDown(tester.view.resetDevicePixelRatio);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -14635,7 +15519,7 @@ void main() {
               content: 'Reply $i',
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -14643,7 +15527,7 @@ void main() {
         await tester.pumpWidget(
           _buildTestable(
             messages: [rootEvent],
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14795,7 +15679,7 @@ void main() {
         addTearDown(tester.view.resetDevicePixelRatio);
 
         final rootEvent = _textMsg(
-          id: 'thread-root',
+          id: threadIdThreadDashRoot,
           pubkey: 'alice',
           content: 'Thread root',
           createdAt: 1000,
@@ -14814,7 +15698,7 @@ void main() {
               ].join('\n'),
               createdAt: 1100 + i,
               extraTags: const [
-                ['e', 'thread-root', '', 'reply'],
+                ['e', threadIdThreadDashRoot, '', 'reply'],
               ],
             ),
         ];
@@ -14824,7 +15708,7 @@ void main() {
           _buildTestable(
             messages: [rootEvent],
             messagesNotifier: messagesNotifier,
-            threadReplies: {'thread-root': replies},
+            threadReplies: {threadIdThreadDashRoot: replies},
             users: const {
               'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
               'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
@@ -14870,7 +15754,7 @@ void main() {
           content: 'My new reply\n${List.filled(30, 'Final line').join('\n')}',
           createdAt: 2000,
           extraTags: const [
-            ['e', 'thread-root', '', 'reply'],
+            ['e', threadIdThreadDashRoot, '', 'reply'],
           ],
         );
 
@@ -14919,7 +15803,7 @@ void main() {
       // the live channel events were folded in, the pill (and its burst) only
       // appeared after leaving the thread and coming back, which refetched.
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -14930,7 +15814,7 @@ void main() {
         content: 'A reply',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'thread-root', '', 'reply'],
+          ['e', threadIdThreadDashRoot, '', 'reply'],
         ],
       );
       final messagesNotifier = _FakeMessagesNotifier([rootEvent]);
@@ -14940,7 +15824,7 @@ void main() {
           messages: [rootEvent],
           messagesNotifier: messagesNotifier,
           threadReplies: {
-            'thread-root': [reply],
+            threadIdThreadDashRoot: [reply],
           },
           users: {
             'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -14964,7 +15848,10 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.byKey(const ValueKey('reaction-pill-👍')), findsNothing);
+      expect(
+        find.byKey(const ValueKey('combined-reaction-tray')),
+        findsNothing,
+      );
 
       // The reaction arrives over the channel socket, as it does on device.
       messagesNotifier.setMessages([
@@ -14975,14 +15862,17 @@ void main() {
 
       // Still on the thread route — no pop needed for the pill to appear.
       expect(find.byType(ThreadDetailPage), findsOneWidget);
-      expect(find.byKey(const ValueKey('reaction-pill-👍')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('combined-reaction-tray')),
+        findsOneWidget,
+      );
     });
 
     testWidgets('a live deletion does not restore the routed thread head', (
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -14993,7 +15883,7 @@ void main() {
         content: 'A reply',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'thread-root', '', 'reply'],
+          ['e', threadIdThreadDashRoot, '', 'reply'],
         ],
       );
       final messagesNotifier = _FakeMessagesNotifier([rootEvent]);
@@ -15003,7 +15893,7 @@ void main() {
           messages: [rootEvent],
           messagesNotifier: messagesNotifier,
           threadReplies: {
-            'thread-root': [reply],
+            threadIdThreadDashRoot: [reply],
           },
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -15031,7 +15921,7 @@ void main() {
 
       messagesNotifier.setMessages([
         rootEvent,
-        _deletion(id: 'delete-root', targetIds: ['thread-root']),
+        _deletion(id: 'delete-root', targetIds: [threadIdThreadDashRoot]),
       ]);
       await tester.pumpAndSettle();
 
@@ -15047,7 +15937,7 @@ void main() {
       tester,
     ) async {
       final rootEvent = _textMsg(
-        id: 'thread-root',
+        id: threadIdThreadDashRoot,
         pubkey: 'alice',
         content: 'Thread root',
         createdAt: 1000,
@@ -15058,7 +15948,7 @@ void main() {
         content: 'No reactions here',
         createdAt: 1100,
         extraTags: const [
-          ['e', 'thread-root', '', 'reply'],
+          ['e', threadIdThreadDashRoot, '', 'reply'],
         ],
       );
       final reactedReply = _textMsg(
@@ -15067,7 +15957,7 @@ void main() {
         content: 'This one has a reaction',
         createdAt: 1200,
         extraTags: const [
-          ['e', 'thread-root', '', 'reply'],
+          ['e', threadIdThreadDashRoot, '', 'reply'],
         ],
       );
 
@@ -15078,7 +15968,7 @@ void main() {
             _reaction(id: 'reaction-1', targetId: 'reply-reacted'),
           ],
           threadReplies: {
-            'thread-root': [bareReply, reactedReply],
+            threadIdThreadDashRoot: [bareReply, reactedReply],
           },
           users: {
             'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
@@ -15104,11 +15994,12 @@ void main() {
       await tester.pumpAndSettle();
 
       // The head keeps a standing +; the bare reply gets none, so a thread
-      // reads as quietly as the channel does. Two + pills, not three: the head
-      // and the reacted reply.
-      expect(find.byKey(const ValueKey('add-reaction-pill')), findsNWidgets(2));
+      // reads quietly. Reacted replies open details, whose first control adds emoji.
+      expect(find.byKey(const ValueKey('add-reaction-pill')), findsOneWidget);
       final headRow = find.descendant(
-        of: find.byKey(const ValueKey('thread-message-group-thread-root')),
+        of: find.byKey(
+          const ValueKey('thread-message-group-$threadIdThreadDashRoot'),
+        ),
         matching: find.byKey(const ValueKey('add-reaction-pill')),
       );
       expect(headRow, findsOneWidget);
@@ -15122,7 +16013,7 @@ void main() {
       expect(
         find.descendant(
           of: find.byKey(const ValueKey('thread-message-group-reply-reacted')),
-          matching: find.byKey(const ValueKey('add-reaction-pill')),
+          matching: find.byKey(const ValueKey('combined-reaction-tray')),
         ),
         findsOneWidget,
       );
@@ -15561,6 +16452,23 @@ class _SynchronousReadStateNotifier extends ReadStateNotifier {
   }) {
     markedContexts[contextId] = unixTimestamp;
     state = state.copyWithContext(contextId, unixTimestamp);
+  }
+
+  final List<String> clearedForcedContexts = [];
+
+  @override
+  void clearForcedUnread(String contextId) {
+    clearedForcedContexts.add(contextId);
+    state = ReadStateState(
+      isReady: state.isReady,
+      pubkey: state.pubkey,
+      contexts: state.contexts,
+      version: state.version + 1,
+      forcedUnreadContexts: {
+        for (final entry in state.forcedUnreadContexts.entries)
+          if (entry.key != contextId) entry.key: entry.value,
+      },
+    );
   }
 }
 
@@ -16111,4 +17019,11 @@ String _previewRowAvatarInitial(WidgetTester tester, String pubkey) {
     find.descendant(of: avatar, matching: find.byType(Text)),
   );
   return initial.data!;
+}
+
+class _MutableColorProfileNotifier extends ProfileNotifier {
+  @override
+  Future<UserProfile?> build() => SynchronousFuture(null);
+
+  void setProfileState(AsyncValue<UserProfile?> value) => state = value;
 }
