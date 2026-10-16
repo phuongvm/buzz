@@ -87,6 +87,12 @@ run_unit_tests() {
   run_test_step "buzz-auth unit tests" \
     cargo test -p buzz-auth --lib -- --nocapture
 
+  # Mesh JWKS proxy-bypass regression: infra-free loopback I/O with
+  # child-process environment isolation. --lib does not select its binary.
+  # Keep this fallback in step with `just test-unit`.
+  run_test_step "buzz-auth mesh JWKS proxy regression" \
+    cargo test -p buzz-auth --test mesh_jwks_proxy -- --nocapture
+
   # Cross-pod disconnect payload tests (NIP-FI and community archive fence;
   # infra-free). Mirrors `just test-unit`.
   run_test_step "buzz-pubsub conn_control tests" \
@@ -294,6 +300,9 @@ run_unit_tests() {
 
   run_test_step "buzz-relay API query parsing tests" \
     cargo test -p buzz-relay --lib api::parse_query_tests:: -- --nocapture
+
+  run_test_step "buzz-relay profile search request tests" \
+    cargo test -p buzz-relay --lib api::profiles:: -- --nocapture
 
   run_test_step "buzz-relay Git transport Off-mode precedence tests" \
     cargo test -p buzz-relay --lib api::git::transport::off_mode_precedence_tests:: -- --nocapture
