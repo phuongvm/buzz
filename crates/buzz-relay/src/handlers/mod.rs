@@ -1,11 +1,17 @@
 /// NIP-42 authentication handler.
 pub mod admin_action_worker;
 pub mod admin_outbox_worker;
+/// NIP-AR Sync subscriptions.
+pub mod artifact_sync;
+#[cfg(test)]
+mod artifact_sync_postgres_tests;
 pub mod auth;
 /// Pure NIP-29 channel membership-authority decisions (kinds 9000/9001/9022).
 pub mod channel_authz;
 /// Subscription close (CLOSE) handler.
 pub mod close;
+/// Per-key single-flight refresh with a minimum interval.
+pub mod coalesced_refresh;
 /// Command executor — transactional processing for command kinds.
 pub mod command_executor;
 /// Relay-operator community provisioning HTTP support.

@@ -130,16 +130,24 @@ pub(crate) async fn token_owner_denial(
     community: buzz_core::CommunityId,
     agent: nostr::PublicKey,
     owner: nostr::PublicKey,
-) -> Option<buzz_auth::DenialClass> {
+) -> Option<(buzz_auth::DenialClass, &'static str)> {
     let ban = principal_ban_outcome(state, community, &owner, false).await;
     if let Some(denial) = ban_admission_denial(ban) {
-        return Some(denial.class);
+        let reason = match ban {
+            BanOutcome::Banned => "owner_banned",
+            _ => "owner_ban_unavailable",
+        };
+        return Some((denial.class, reason));
     }
     // No stored owner yet: enforce would link this one.
     let link = crate::api::relay_members::stored_owner_link(state, community, &agent, &owner)
         .await
         .unwrap_or(crate::api::relay_members::OwnerLink::Linked);
-    owner_link_denial(link, true).map(|denial| denial.class)
+    let reason = match link {
+        crate::api::relay_members::OwnerLink::Conflict => "not_stored_owner",
+        _ => "owner_link_unavailable",
+    };
+    owner_link_denial(link, true).map(|denial| (denial.class, reason))
 }
 
 fn ban_denial(outcome: BanOutcome) -> Option<(&'static str, &'static str, AuthOutcome)> {
@@ -433,6 +441,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         Ok(mut auth_ctx) => {
             let pubkey = auth_ctx.pubkey;
 
+            conn.community_control.prove_nip_fi_line(pubkey);
             let shadow = conn.community_control.nip_fi_shadow();
             if let Some(shadow) = shadow {
                 shadow.observe_pairing(pubkey);
@@ -816,6 +825,11 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
             state.conn_manager.mark_admitted(conn_id);
             conn.send(RelayMessage::ok(&event_id_hex, true, ""));
+            crate::verified_profiles::admitted(
+                &state,
+                &conn.tenant,
+                conn.nip_fi_assertion.as_ref(),
+            );
             // _auth_permit drops here — expiry's write guard may proceed.
         }
         Err(e) => {
@@ -1594,6 +1608,60 @@ mod tests {
             handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
         });
         assert_eq!(records, ["pairing/denied"]);
+    }
+
+    // The pairing would-deny names the key AUTH proved, not the one the
+    // token asserts. Mutation: attributing the asserted key, or none, fails.
+    #[test]
+    fn shadow_root_pairing_denial_logs_the_proven_key() {
+        use crate::nip_fi_shadow_session::tests::{shadow_logged, shadow_state};
+        let signer = Keys::generate();
+        let asserted = Keys::generate().public_key();
+        let (records, lines) = shadow_logged(async {
+            let state = std::sync::Arc::new(shadow_state(None).await);
+            let (t, event) = shadow_root_conn(&state, asserted, &signer, HOUR);
+            handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+        });
+        assert_eq!(records, ["pairing/denied"]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("reason=\"key_mismatch\""), "{lines:?}");
+        let proven = format!("pubkey=\"{}\"", signer.public_key().to_hex());
+        assert!(lines[0].contains(&proven), "{lines:?}");
+    }
+
+    // An upgrade would-deny's line names the key the connection's AUTH
+    // verifies, and is counted once, at the upgrade. Mutation: deleting
+    // root's `prove_nip_fi_line` logs `absent`.
+    #[test]
+    fn shadow_upgrade_would_deny_logs_the_root_auth_key() {
+        use crate::nip_fi_shadow_session::tests::{shadow_logged, shadow_state};
+        let signer = Keys::generate();
+        let (records, lines) = shadow_logged(async {
+            let state = std::sync::Arc::new(shadow_state(None).await);
+            let line = crate::nip_fi_shadow::tests::upgrade_line("ws");
+            let challenge = "upgrade-would-deny-challenge".to_owned();
+            let pending = AuthState::Pending {
+                challenge: challenge.clone(),
+                started_at: Instant::now(),
+            };
+            let nil = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+            let t = crate::connection::tests::test_conn_in(pending, None, nil);
+            t.conn.community_control.attach_nip_fi_line(Some(&line));
+            let event = EventBuilder::new(Kind::Authentication, "")
+                .tag(Tag::parse(["relay", "ws://test.local"]).unwrap())
+                .tag(Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&signer)
+                .unwrap();
+            handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+        });
+        assert_eq!(records, ["assertion/missing"]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("reason=\"missing_assertion\""),
+            "{lines:?}"
+        );
+        let proven = format!("pubkey=\"{}\"", signer.public_key().to_hex());
+        assert!(lines[0].contains(&proven), "{lines:?}");
     }
 
     // A failed owner read records `owner` as unavailable, as enforce fails
@@ -3876,7 +3944,7 @@ mod tests {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-        let state = crate::state::tests::test_state_with_database_url(
+        let state = crate::state::tests::test_state_with_unreachable_database_url(
             "postgres://buzz:buzz_dev@127.0.0.1:1/buzz",
         )
         .await;

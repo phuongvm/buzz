@@ -43,6 +43,7 @@ class HostedJourneyFixture {
   final identityStorage = JourneyIdentityStorage();
   final requests = <http.Request>[];
   Future<void> Function()? beforeBrowserReturn;
+  Future<void> Function()? beforeStatusReturn;
   Future<void> Function()? beforeEnrollmentReturn;
   Future<void> Function()? beforeUploadReturn;
   final probes = <Community>[];
@@ -70,11 +71,15 @@ class HostedJourneyFixture {
   final socketHeaders = <Map<String, String>>[];
   bool offerProfile = true;
   bool profileUnavailable = false;
+  int profileSaveFailures = 0;
   bool rejectList = false;
+  int saveFailures = 0;
+  final knownSaved = <String>{};
   bool missingList = false;
   bool loseCreateResponse = false;
   bool loseClaimResponse = false;
   bool inviteExpired = false;
+  String? claimError;
   final owned = <Map<String, dynamic>>[];
   final expiry = DateTime.now()
       .toUtc()
@@ -167,6 +172,7 @@ class HostedJourneyFixture {
         'identity': bound == null ? null : {'pubkey_hex': bound},
       };
     } else if (path.endsWith('/status')) {
+      await beforeStatusReturn?.call();
       result = {
         'current_nostr_pubkey': bound,
         'backup_nostr_pubkeys': cloudKeys.map((k) => k.public).toList(),
@@ -239,6 +245,23 @@ class HostedJourneyFixture {
         throw AccountFailure.unavailable;
       }
       result = {'community': created};
+    } else if (path.endsWith('/known-communities/list')) {
+      if (rejectList) return http.Response('{}', 503);
+      result = {
+        if (rows.isNotEmpty)
+          'communities': [
+            for (final row in rows)
+              {'community_url': 'wss://${row['normalized_host']}'},
+          ],
+      };
+    } else if (path.endsWith('/known-communities/add')) {
+      expect(request.method, 'POST');
+      final url = jsonDecode(request.body)['community_url'] as String;
+      knownSaved.add(url);
+      if (saveFailures-- > 0) return http.Response('{}', 503);
+      result = {
+        'community': {'community_url': url},
+      };
     } else if (path.endsWith('/communities/joined')) {
       if (rejectList) return http.Response('{}', 503);
       if (missingList) return http.Response('{}', 404);
@@ -259,6 +282,9 @@ class HostedJourneyFixture {
       }
       result = {'receipt': 'synthetic-policy-receipt'};
     } else if (path == '/api/invites/claim') {
+      if (claimError != null) {
+        return http.Response(jsonEncode({'error': claimError}), 403);
+      }
       if (loseClaimResponse) {
         loseClaimResponse = false;
         rows.add(row(request.url.host.split('.').first));
@@ -293,24 +319,35 @@ class HostedJourneyFixture {
   Future<void> mount(
     WidgetTester tester, {
     bool openEntry = true,
+    bool addingCommunity = true,
     PairingCredentialValidator? pairingValidator,
+    PairingSocketFactory? pairingSocketFactory,
   }) async {
     await tester.binding.setSurfaceSize(const Size(440, 1100));
     tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('buzz/browser_auth'),
+      (_) async => null,
+    );
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
       const MethodChannel('buzz/hosted_hpke'),
-      (_) async => {
-        'enc': Uint8List.fromList([4, ...List.filled(64, 2)]),
-        'ciphertext': Uint8List(48),
-      },
+      (call) async => call.method == 'isSupported'
+          ? true
+          : {
+              'enc': Uint8List.fromList([4, ...List.filled(64, 2)]),
+              'ciphertext': Uint8List(48),
+            },
     );
     await tester.pumpWidget(
       WidgetHelpers.testable(
         disableAnimations: true,
         overrides: [
           hostedFlowProvider.overrideWith(createFlow),
-          if (pairingValidator != null)
+          if (pairingValidator != null || pairingSocketFactory != null)
             pairingProvider.overrideWith(
-              () => PairingNotifier(credentialValidator: pairingValidator),
+              () => PairingNotifier(
+                credentialValidator: pairingValidator,
+                socketFactory: pairingSocketFactory,
+              ),
             ),
           if (relayAuthEnabled) ...[
             hostedRelayAuthProvider.overrideWith((ref) {
@@ -368,7 +405,7 @@ class HostedJourneyFixture {
                 onPressed: () => Navigator.of(context).push(
                   MaterialPageRoute<void>(
                     builder: (_) =>
-                        const OnboardingAppEntry(addingCommunity: true),
+                        OnboardingAppEntry(addingCommunity: addingCommunity),
                   ),
                 ),
                 child: const Text('Community home'),
@@ -448,6 +485,10 @@ class HostedJourneyFixture {
     await tester.pump();
     PendingDeepLinkNotifier.debugUriStreamOverride = null;
     tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('buzz/browser_auth'),
+      null,
+    );
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
       const MethodChannel('buzz/hosted_hpke'),
       null,
     );
@@ -491,11 +532,19 @@ class _Profile extends ProfileNotifier {
 
   @override
   Future<void> updateDisplayName(String name) async {
+    if (fixture.profileSaveFailures > 0) {
+      fixture.profileSaveFailures--;
+      throw StateError('profile save unavailable');
+    }
     fixture.profileWrites.add(name);
   }
 
   @override
   Future<void> updateSetup(String name, String? avatarUrl) async {
+    if (fixture.profileSaveFailures > 0) {
+      fixture.profileSaveFailures--;
+      throw StateError('profile save unavailable');
+    }
     fixture.profileWrites.add(name);
     fixture.profileAvatars.add(avatarUrl);
   }

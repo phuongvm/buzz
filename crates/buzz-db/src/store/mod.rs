@@ -28,6 +28,8 @@ pub(crate) mod event_follow_up;
 pub mod nip_fi_binding;
 /// User-specific deletion submission and inventory preparation.
 pub mod user_deletion;
+/// Operator-global user restrictions and identity-lock primitives.
+pub mod user_deletion_fences;
 
 #[cfg(test)]
 mod event_follow_up_postgres_tests;
@@ -81,6 +83,9 @@ pub mod workflow;
 pub mod artifact;
 
 mod artifact_query;
+/// Timestamp-based incremental artifact reads.
+pub mod artifact_sync;
+pub use artifact_query::{ArtifactSnapshot, SnapshotDenied};
 
 #[cfg(test)]
 mod artifact_postgres_tests;
@@ -93,3 +98,6 @@ mod unlisted_channels_postgres_tests;
 
 #[cfg(test)]
 mod admission_postgres_tests;
+
+/// Durable NIP-FI verified-profile projection state.
+pub mod verified_profiles;

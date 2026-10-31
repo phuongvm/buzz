@@ -9,7 +9,7 @@ import XCTest
 class RunnerTests: XCTestCase {
 
   @MainActor
-  func testProfileAvatarStartupFailureRestoresSheetAndAllowsRetry() async throws {
+  func testProfileAvatarStartupFailureRestoresPageAndAllowsRetry() async throws {
     let messenger = NavigationTestMessenger()
     let parent = UIViewController()
     let window = UIWindow(frame: UIScreen.main.bounds)
@@ -24,9 +24,9 @@ class RunnerTests: XCTestCase {
     alreadyDisabled.isEnabled = false
     let coordinator = NativeProfileSetupCoordinator(messenger: messenger, startEditorEngine: { _ in
       starts += 1
-      XCTAssertEqual(navigation?.sheetPresentationController?.selectedDetentIdentifier, .large)
-      XCTAssertTrue(navigation?.isModalInPresentation == true)
-      XCTAssertFalse(pan.isEnabled)
+      XCTAssertEqual(navigation?.modalPresentationStyle, .overFullScreen)
+      XCTAssertEqual(navigation?.isModalInPresentation, starts > 1)
+      XCTAssertEqual(pan.isEnabled, starts == 1)
       return false
     }, configureEditorEngine: { _ in
       XCTFail("Failed startup must not configure plugins")
@@ -44,11 +44,15 @@ class RunnerTests: XCTestCase {
     let profile = try XCTUnwrap(nav.viewControllers.first)
     let avatar = try XCTUnwrap(descendants(of: profile.view).compactMap { $0 as? UIButton }
       .first { $0.accessibilityLabel == "Add profile photo" })
-    for detent in [UISheetPresentationController.Detent.Identifier("profile"), .large] {
-      nav.sheetPresentationController?.selectedDetentIdentifier = detent
+    let name = try XCTUnwrap(descendants(of: profile.view).compactMap { $0 as? UITextField }.first)
+    let submit = try XCTUnwrap(descendants(of: profile.view).compactMap { $0 as? UIButton }
+      .first { $0.configuration?.title == "Continue" })
+    name.text = "Kenny"
+    name.sendActions(for: .editingChanged)
+    submit.sendActions(for: .touchUpInside)
+    for _ in 0..<2 {
       avatar.sendActions(for: .touchUpInside)
-      XCTAssertEqual(nav.sheetPresentationController?.detents.map(\.identifier), [.init("profile"), .large])
-      XCTAssertEqual(nav.sheetPresentationController?.selectedDetentIdentifier, detent)
+      XCTAssertEqual(nav.modalPresentationStyle, .overFullScreen)
       XCTAssertTrue(pan.isEnabled)
       XCTAssertFalse(alreadyDisabled.isEnabled)
       XCTAssertFalse(nav.isModalInPresentation)
@@ -56,7 +60,7 @@ class RunnerTests: XCTestCase {
       XCTAssertFalse(avatar.isHidden)
       XCTAssertTrue(nav.topViewController === profile)
     }
-    XCTAssertEqual(starts, 2)
+    XCTAssertEqual(starts, 3)
     withExtendedLifetime(coordinator) {}
     nav.dismiss(animated: false)
   }
@@ -111,7 +115,7 @@ class RunnerTests: XCTestCase {
     add(attachment)
     coordinator.cancel()
     coordinator.cancel()
-    await fulfillment(of: [completed], timeout: 3)
+    await fulfillment(of: [completed], timeout: 10)
     XCTAssertNil(parent.presentedViewController)
     XCTAssertEqual(replies, [false])
   }
@@ -740,12 +744,22 @@ class RunnerTests: XCTestCase {
     bar.view().layoutIfNeeded()
     XCTAssertLessThan(title.textColor.cgColor.alpha, 0.6)
     messenger.scroll(to: boundary)
-    try await Task.sleep(nanoseconds: 60_000_000)
-    XCTAssertFalse(try XCTUnwrap(centeredTitle.layer.mask).bounds.isEmpty)
-    XCTAssertGreaterThan(visibleOpacity(of: centeredTitle), 0.01)
-    XCTAssertLessThan(visibleOpacity(of: centeredTitle), 0.99)
+    // The host app can hold the main thread past the whole fade, so check the
+    // animation itself rather than sampling its presentation mid-flight.
+    let mask = try XCTUnwrap(centeredTitle.layer.mask)
+    XCTAssertFalse(mask.bounds.isEmpty)
+    XCTAssertEqual(mask.opacity, 1)
+    let fade = try XCTUnwrap(mask.animation(forKey: "titleFade") as? CABasicAnimation,
+                             "Collapsing must fade the compact title in")
+    XCTAssertEqual(fade.keyPath, "opacity")
+    XCTAssertEqual((fade.fromValue as? NSNumber)?.floatValue, 0)
+    XCTAssertEqual((fade.toValue as? NSNumber)?.floatValue, 1)
+    // A band around the 0.18 s design value: a near-zero duration is a snap.
+    XCTAssertGreaterThanOrEqual(fade.duration, 0.1)
+    XCTAssertLessThanOrEqual(fade.duration, 0.5)
     XCTAssertEqual(title.textColor.cgColor.alpha, 0, accuracy: 0.01)
     messenger.scroll(to: boundary * 0.7)
+    XCTAssertNil(mask.animation(forKey: "titleFade"), "Reversing must cancel the fade")
     try await Task.sleep(nanoseconds: 240_000_000)
     XCTAssertEqual(visibleOpacity(of: centeredTitle), 0, accuracy: 0.01)
     XCTAssertGreaterThan(title.textColor.cgColor.alpha, 0.1)

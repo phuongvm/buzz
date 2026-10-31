@@ -14,6 +14,10 @@ use crate::Result;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
+#[cfg(test)]
+#[path = "tests/schema_fence_bootstrap_postgres_tests.rs"]
+mod schema_fence_bootstrap_postgres_tests;
+
 /// Run all pending Buzz database migrations.
 ///
 /// The entire run holds the exclusive [`SCHEMA_DESTRUCTION_LOCK_KEY`] session
@@ -58,7 +62,6 @@ async fn run_migrations_locked(conn: &mut PgConnection) -> Result<()> {
     // guard, so migration fails closed if any is missing. (The fence probe
     // re-runs this same check at startup on non-migrating relays.)
     crate::replica_fence::verify_floor_guard_catalog(&mut *conn).await?;
-    crate::channel::verify_channel_roster_fence_catalog(&mut *conn).await?;
     Ok(())
 }
 
@@ -192,6 +195,7 @@ mod retirement_postgres_tests;
 #[cfg(test)]
 mod postgres_tests {
     use super::*;
+    use crate::test_support::ScratchDb;
     use std::{
         collections::BTreeSet,
         fs,
@@ -546,6 +550,7 @@ mod postgres_tests {
             "entity_deletion_approvals",
             "entity_deletion_requests",
             "entity_deletion_stage_history",
+            "user_deletion_fences",
             "community_deletion_approvals",
             "community_deletion_checkpoints",
             "community_deletion_manifest_keys",
@@ -772,16 +777,14 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 73);
-        assert_eq!(migrations[72].version, 73);
-        assert_eq!(migrations[71].version, 72);
-        assert_eq!(migrations[70].version, 71);
+        assert_eq!(migrations.len(), 79);
+        for (index, migration) in migrations.iter().enumerate() {
+            assert_eq!(migration.version, (index + 1) as i64);
+        }
         assert!(migrations[70]
             .sql
             .as_str()
             .contains("ADD COLUMN unlisted BOOLEAN NOT NULL DEFAULT FALSE"));
-        assert_eq!(migrations[69].version, 70);
-        assert_eq!(migrations[68].version, 69);
         assert_eq!(migrations[67].version, 68);
         assert!(migrations[67]
             .sql
@@ -799,6 +802,26 @@ mod postgres_tests {
         let desired_schema = crate::test_support::desired_state_schema_sql();
         assert!(!desired_schema.contains("events_refresh_channel_ttl"));
         assert!(!desired_schema.contains("refresh_channel_ttl_after_event_insert"));
+        assert!(desired_schema.contains("legacy_admission BOOLEAN NOT NULL DEFAULT true"));
+        assert_eq!(migrations[65].version, 66);
+        assert!(migrations[65]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE community_nip_fi_issuers"));
+        assert_eq!(migrations[74].version, 75);
+        let invite_migration = strip_sql_comments(migrations[74].sql.as_str());
+        assert!(invite_migration.contains("SET LOCAL lock_timeout = '5s'"));
+        assert!(invite_migration.contains("SET LOCAL statement_timeout = '30s'"));
+        assert!(
+            invite_migration.contains("ADD COLUMN legacy_admission BOOLEAN NOT NULL DEFAULT true")
+        );
+        assert!(invite_migration.contains("ADD COLUMN revoked_at TIMESTAMPTZ"));
+        assert!(!invite_migration.to_ascii_uppercase().contains("UPDATE "));
+        assert!(!invite_migration
+            .to_ascii_uppercase()
+            .contains("CREATE FUNCTION"));
+        assert!(!desired_schema.contains("invite_admission_lock"));
+
         assert_eq!(migrations[58].version, 59);
         assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
         assert_eq!(migrations[59].version, 60);
@@ -818,11 +841,6 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("CREATE FUNCTION profile_name_fields"));
-        assert_eq!(migrations[65].version, 66);
-        assert!(migrations[65]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE community_nip_fi_issuers"));
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
             .sql
@@ -2550,23 +2568,13 @@ mod postgres_tests {
     async fn cancelled_migration_cannot_expose_shared_lock_while_ddl_backend_lives() {
         use std::time::Instant;
 
-        use sqlx::AssertSqlSafe;
-
         // Dedicated database: the probe table and the orphaned backend must
         // stay invisible to concurrent tests in the shared database.
         let base_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_owned());
-        let admin = PgPool::connect(&base_url)
-            .await
-            .expect("connect admin database");
-        let probe_db = format!("buzz_lock_cancel_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {probe_db}")))
-            .execute(&admin)
-            .await
-            .expect("create probe database");
-        let (base_prefix, _) = base_url.rsplit_once('/').expect("database url has a path");
-        let pool = PgPool::connect(&format!("{base_prefix}/{probe_db}"))
+        let probe_db = ScratchDb::create(&base_url, "buzz_lock_cancel").await;
+        let pool = PgPool::connect(probe_db.url())
             .await
             .expect("connect probe database");
         sqlx::query("CREATE TABLE schema_lock_cancel_probe (id int)")
@@ -2699,14 +2707,6 @@ mod postgres_tests {
             committed,
             "orphaned migration DDL commits after cancellation; the lock must cover it"
         );
-
-        pool.close().await;
-        sqlx::query(AssertSqlSafe(format!(
-            "DROP DATABASE {probe_db} WITH (FORCE)"
-        )))
-        .execute(&admin)
-        .await
-        .expect("drop probe database");
     }
 
     pub(super) async fn connect_test_pool() -> PgPool {
@@ -2770,8 +2770,6 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn admin_schema_parity_between_desired_state_and_migrations() {
-        use sqlx::AssertSqlSafe;
-
         async fn columns(
             pool: &PgPool,
             table: &str,
@@ -2852,25 +2850,13 @@ mod postgres_tests {
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_owned());
         let conn = parse_pg_url(&base_url);
-        let admin = PgPool::connect(&base_url)
-            .await
-            .expect("connect admin database");
-        let (base_prefix, _) = base_url.rsplit_once('/').expect("database url has a path");
 
-        let desired_db = format!("buzz_admin_desired_{}", uuid::Uuid::new_v4().simple());
-        let migrated_db = format!("buzz_admin_migrated_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {desired_db}")))
-            .execute(&admin)
-            .await
-            .expect("create desired-state probe database");
-        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {migrated_db}")))
-            .execute(&admin)
-            .await
-            .expect("create migrated probe database");
+        let desired_db = ScratchDb::create(&base_url, "buzz_admin_desired").await;
+        let migrated_db = ScratchDb::create(&base_url, "buzz_admin_migrated").await;
 
         // Bootstrap the desired-state probe the way the test-relay launchers do:
         // the real pgschema binary, then the post-apply reconcile script.
-        let apply = pgschema(&conn, &desired_db, &["apply", "--auto-approve"]);
+        let apply = pgschema(&conn, desired_db.name(), &["apply", "--auto-approve"]);
         assert!(
             apply.status.success(),
             "pgschema apply failed: {}\n{}",
@@ -2878,7 +2864,7 @@ mod postgres_tests {
             String::from_utf8_lossy(&apply.stderr),
         );
 
-        let desired = PgPool::connect(&format!("{base_prefix}/{desired_db}"))
+        let desired = PgPool::connect(desired_db.url())
             .await
             .expect("connect desired-state probe database");
         sqlx::raw_sql(include_str!(
@@ -2887,7 +2873,7 @@ mod postgres_tests {
         .execute(&desired)
         .await
         .expect("reconcile desired-state probe database");
-        let migrated = PgPool::connect(&format!("{base_prefix}/{migrated_db}"))
+        let migrated = PgPool::connect(migrated_db.url())
             .await
             .expect("connect migrated probe database");
         MIGRATOR
@@ -2901,7 +2887,12 @@ mod postgres_tests {
             "relay_operator_audit",
             "entity_deletion_approvals",
             "entity_deletion_requests",
+            "artifact_heads",
+            "artifact_revisions",
+            "channel_members",
+            "communities",
             "entity_deletion_stage_history",
+            "user_deletion_fences",
         ] {
             assert_eq!(
                 columns(&desired, table).await,
@@ -2938,6 +2929,7 @@ mod postgres_tests {
         for table in [
             "entity_deletion_requests",
             "entity_deletion_stage_history",
+            "user_deletion_fences",
             "entity_deletion_approvals",
         ] {
             assert_eq!(
@@ -2945,17 +2937,6 @@ mod postgres_tests {
                 constraints(&migrated, table).await,
                 "constraint parity mismatch for {table}"
             );
-        }
-
-        desired.close().await;
-        migrated.close().await;
-        for probe_db in [desired_db, migrated_db] {
-            sqlx::query(AssertSqlSafe(format!(
-                "DROP DATABASE {probe_db} WITH (FORCE)"
-            )))
-            .execute(&admin)
-            .await
-            .expect("drop probe database");
         }
     }
 
@@ -2978,27 +2959,18 @@ mod postgres_tests {
         use crate::store::partition::{
             maintain_partitions, PartitionMaintenancePolicy, PARTITION_MANAGER_MONTHS_AHEAD,
         };
-        use sqlx::AssertSqlSafe;
 
         let base_url = crate::test_support::database_url();
         let conn = parse_pg_url(&base_url);
-        let admin = PgPool::connect(&base_url)
-            .await
-            .expect("connect admin database");
-        let (base_prefix, _) = base_url.rsplit_once('/').expect("database url has a path");
-        let database = format!("buzz_pgschema_reapply_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {database}")))
-            .execute(&admin)
-            .await
-            .expect("create probe database");
+        let database = ScratchDb::create(&base_url, "buzz_pgschema_reapply").await;
 
-        let pool = PgPool::connect(&format!("{base_prefix}/{database}"))
+        let pool = PgPool::connect(database.url())
             .await
             .expect("connect probe database");
         // The bootstrap every pgschema caller runs; the reconcile script
         // attaches the declared children.
         let bootstrap = |round: &str| {
-            let apply = pgschema(&conn, &database, &["apply", "--auto-approve"]);
+            let apply = pgschema(&conn, database.name(), &["apply", "--auto-approve"]);
             assert!(
                 apply.status.success(),
                 "{round} pgschema apply failed: {}\n{}",
@@ -3083,7 +3055,7 @@ mod postgres_tests {
             );
         }
 
-        let plan = pgschema(&conn, &database, &["plan", "--output-sql", "stdout"]);
+        let plan = pgschema(&conn, database.name(), &["plan", "--output-sql", "stdout"]);
         let plan_sql = String::from_utf8_lossy(&plan.stdout);
         assert!(
             plan.status.success(),
@@ -3098,14 +3070,6 @@ mod postgres_tests {
         bootstrap("second")
             .await
             .expect("second post-apply reconciliation");
-        pool.close().await;
-
-        sqlx::query(AssertSqlSafe(format!(
-            "DROP DATABASE {database} WITH (FORCE)"
-        )))
-        .execute(&admin)
-        .await
-        .expect("drop probe database");
     }
 
     #[tokio::test]

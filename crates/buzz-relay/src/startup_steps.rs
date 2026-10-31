@@ -59,8 +59,6 @@ pub enum StartupStep {
     AuditConnect,
     /// Connect Redis commands and pub/sub.
     RedisConnect,
-    /// Connect the search database pool.
-    SearchConnect,
     /// Warm NIP-FI JWKS snapshots (only when NIP-FI is configured).
     NipFiJwksWarm,
     /// Load the first NIP-FI binding snapshot (only for the `database` source).
@@ -75,8 +73,6 @@ pub enum StartupStep {
     MeshInitialReconcile,
     /// Run the git object-store conformance probe (when enabled).
     GitConformanceProbe,
-    /// Verify the channel roster fence.
-    ChannelRosterFence,
     /// Repair large NIP-29 channel roster snapshots.
     LargeRosterReconcile,
     /// Bind the private health listener.
@@ -96,7 +92,6 @@ impl StartupStep {
         Self::MembershipBootstrap,
         Self::AuditConnect,
         Self::RedisConnect,
-        Self::SearchConnect,
         Self::NipFiJwksWarm,
         Self::NipFiSnapshotLoad,
         Self::MeshBoot,
@@ -104,7 +99,6 @@ impl StartupStep {
         Self::MeshPublish,
         Self::MeshInitialReconcile,
         Self::GitConformanceProbe,
-        Self::ChannelRosterFence,
         Self::LargeRosterReconcile,
         Self::HealthBind,
         Self::ListenerBind,
@@ -121,7 +115,6 @@ impl StartupStep {
             Self::MembershipBootstrap => "membership_bootstrap",
             Self::AuditConnect => "audit_connect",
             Self::RedisConnect => "redis_connect",
-            Self::SearchConnect => "search_connect",
             Self::NipFiJwksWarm => "nip_fi_jwks_warm",
             Self::NipFiSnapshotLoad => "nip_fi_snapshot_load",
             Self::MeshBoot => "mesh_boot",
@@ -129,7 +122,6 @@ impl StartupStep {
             Self::MeshPublish => "mesh_publish",
             Self::MeshInitialReconcile => "mesh_initial_reconcile",
             Self::GitConformanceProbe => "git_conformance_probe",
-            Self::ChannelRosterFence => "channel_roster_fence",
             Self::LargeRosterReconcile => "large_roster_reconcile",
             Self::HealthBind => "health_bind",
             Self::ListenerBind => "listener_bind",
