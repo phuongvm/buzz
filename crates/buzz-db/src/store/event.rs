@@ -263,21 +263,22 @@ pub async fn huddle_started_links(
         crate::observability::WriterOperation::SubscriptionHistory,
     )
     .await?;
+    // PG15+PG17 compatible: the PG16-only JSON predicate syntax is avoided, so SQL only narrows
+    // candidates by creator, kind, size and a textual UUID match. Rust then
+    // parses the JSON (`huddle_started_content_links`) and ignores malformed
+    // content. Rows are ordered newest-first per session, so the first valid
+    // row per session wins (same semantics as the former DISTINCT ON).
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT ON (backing.id)
-               backing.id AS session_id,
+        SELECT backing.id AS session_id,
                start.channel_id AS parent_channel_id,
-               backing.created_by
+               backing.created_by,
+               start.content
         FROM events start
         JOIN channels backing
           ON backing.community_id = start.community_id
-         AND backing.id::text = CASE
-             WHEN start.content IS JSON OBJECT
-             THEN (start.content::json ->> 'ephemeral_channel_id')
-             ELSE NULL
-         END
          AND backing.deleted_at IS NULL
+         AND start.content ILIKE '%' || backing.id::text || '%'
         WHERE start.deleted_at IS NULL
           AND start.community_id = $1
           AND start.channel_id = ANY($2)
@@ -296,15 +297,23 @@ pub async fn huddle_started_links(
     .fetch_all(&mut *connection)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get("session_id")?,
-                row.try_get("parent_channel_id")?,
-                row.try_get("created_by")?,
-            ))
-        })
-        .collect()
+    let mut links: Vec<(Uuid, Uuid, Vec<u8>)> = Vec::new();
+    for row in rows {
+        let session_id: Uuid = row.try_get("session_id")?;
+        if links.last().is_some_and(|(seen, _, _)| *seen == session_id) {
+            continue;
+        }
+        let content: String = row.try_get("content")?;
+        if !huddle_started_content_links(&content, session_id) {
+            continue;
+        }
+        links.push((
+            session_id,
+            row.try_get("parent_channel_id")?,
+            row.try_get("created_by")?,
+        ));
+    }
+    Ok(links)
 }
 
 /// Return whether a creator-signed huddle-start event links a parent channel
@@ -4141,6 +4150,9 @@ mod postgres_tests {
         for (index, content) in [
             "not-json".to_owned(),
             serde_json::json!({ "ephemeral_channel_id": session }).to_string(),
+            // Newest row textually contains the session UUID but is not JSON:
+            // it must be skipped without hiding the older valid link.
+            format!("not-json mentions {session}"),
         ]
         .into_iter()
         .enumerate()
