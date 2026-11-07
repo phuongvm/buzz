@@ -1,3 +1,4 @@
+import 'message_author_visibility.dart';
 import 'message_swipe_reply.dart';
 import '../../shared/widgets/ios_scroll_to_top.dart';
 import 'message_footer_layout.dart';
@@ -61,6 +62,7 @@ import 'reaction_row.dart';
 import '../../shared/read_state/read_state_provider.dart';
 import 'send_message_provider.dart';
 import 'sticky_date_header.dart';
+import 'date_header_scroll_activity.dart';
 import 'reading_marks.dart';
 import 'timeline_message.dart';
 
@@ -142,10 +144,9 @@ class ThreadDetailPage extends HookConsumerWidget {
     final relayReplyState = ref.watch(threadRepliesProvider(repliesArgs));
     final repliesState = ref.watch(threadRepliesWithLocalProvider(repliesArgs));
     final relayRepliesAvailable = relayReplyState.value != null;
-    // The thread query is one-shot and asks only for content kinds, so a
-    // reaction, edit, or deletion that lands while the thread is open never
-    // reaches it — a new pill (and its burst) only showed up after leaving and
-    // re-entering, which refetched. The channel socket already receives those
+    // The thread query is one-shot: it carries the reactions, edits, and
+    // deletions that existed when it ran, but one that lands while the thread
+    // is open never reaches it. The channel socket already receives those
     // events, so union the two sources and format once.
     final liveChannelEvents =
         ref.watch(channelMessagesProvider(channelId)).value ??
@@ -266,6 +267,7 @@ class ThreadDetailPage extends HookConsumerWidget {
     final itemPositionsListener = useMemoized(ItemPositionsListener.create);
     final listViewport = useMemoized(LaidOutViewport.new);
     useEffect(() => listViewport.dispose, [listViewport]);
+    final dateScrollActivity = useDateHeaderScrollActivity(threadHead.id);
     final stickyDateHeaderState = useValueNotifier(
       StickyDateHeaderState.hidden,
     );
@@ -937,6 +939,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                   child: StickyDateHeader(
                     key: const ValueKey('thread-sticky-date-header'),
                     state: stickyDateHeaderState,
+                    scrollVisible: dateScrollActivity,
                   ),
                 ),
               ],
@@ -951,6 +954,7 @@ class ThreadDetailPage extends HookConsumerWidget {
             children: [
               Expanded(
                 child: _ThreadMessageList(
+                  dateScrollActivity: dateScrollActivity,
                   headHeight: headHeight.value ?? 0,
                   onHeadHeightChanged: (height) {
                     if (context.mounted) headHeight.value = height;
