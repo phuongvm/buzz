@@ -30,6 +30,9 @@ pub enum ChannelAuthzError {
     /// Actor tried to grant `owner`/`admin` without holding it.
     #[error("only owners/admins may grant elevated roles")]
     ElevatedRoleGrantDenied,
+    /// Actor tried to grant ownership or change an owner's role without being an owner.
+    #[error("only owners may grant ownership or change an owner's role")]
+    OwnershipChangeDenied,
     /// Actor tried to change an active member's role without being elevated.
     #[error("only owners/admins may change an active member's role")]
     RoleChangeDenied,
@@ -69,6 +72,7 @@ impl From<MemberPutDenial> for ChannelAuthzError {
         match denial {
             MemberPutDenial::NotAMember => Self::ActorNotAuthorized,
             MemberPutDenial::ElevatedRoleGrant => Self::ElevatedRoleGrantDenied,
+            MemberPutDenial::OwnershipChange => Self::OwnershipChangeDenied,
             MemberPutDenial::GuestCannotAdd => Self::GuestCannotAdd,
             MemberPutDenial::SelfJoinAboveJoinRole => Self::SelfJoinAboveJoinRole,
             MemberPutDenial::RoleChange => Self::RoleChangeDenied,
@@ -80,7 +84,7 @@ impl From<MemberPutDenial> for ChannelAuthzError {
 ///
 /// This is the single definition of last-owner protection. Every call site
 /// that once restated it — kind:9000 demotion, kind:9001 self-removal,
-/// kind:9022 leave, and the `handle_remove_user` / `handle_leave_request`
+/// kind:9022 leave, and the `handle_leave_request`
 /// appliers — asks this one question and supplies its own wording.
 ///
 /// `members` must already be filtered to *active* membership; both
@@ -203,34 +207,47 @@ pub fn decide_channel_add_policy(
 /// What authority `actor` holds to remove *somebody else* (kind:9001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveOtherDecision {
-    /// Channel owner or admin — authorized for any target.
+    /// Channel owner, or an admin removing a non-owner.
     Allow,
     /// An active non-elevated member. Authorized only if they own the target
     /// agent, which the caller must confirm with a database read.
     CheckAgentOwner,
-    /// Not an active member. Denied without any further read — you must be in
-    /// the channel to remove anyone, even your own bot.
+    /// Not an active member, or a non-owner removing an owner. Denied even
+    /// when the actor owns the target agent.
     Deny,
 }
 
 /// Classify `actor`'s authority to remove another member (NIP-29 kind:9001).
 ///
 /// `relay_role` is the actor's community-wide `relay_members` role, if any.
-/// A relay owner or admin already holds community-wide moderation authority
-/// (the rule [`super::moderation_authz`] applies to kick/ban), so the same
-/// principal may remove any member from any channel. This is the only
-/// authority that can exist in a DM: every DM participant is a plain
-/// `member`, so without it a stray identity added to a DM could never be
-/// removed by anyone.
+/// Relay owners/admins have community-wide authority over non-owner targets,
+/// including DMs where every participant is a plain member. A channel owner is
+/// still required to remove another channel owner.
 pub fn classify_remove_other(
     members: &[MemberRecord],
     actor: &[u8],
+    target: &[u8],
     relay_role: Option<&str>,
 ) -> RemoveOtherDecision {
+    if members
+        .iter()
+        .any(|m| m.pubkey == target && m.role == "owner")
+        && !members.iter().any(|m| m.pubkey == actor && m.role == "owner")
+    {
+        return RemoveOtherDecision::Deny;
+    }
     if matches!(relay_role, Some("owner") | Some("admin")) {
         return RemoveOtherDecision::Allow;
     }
     match members.iter().find(|m| m.pubkey == actor) {
+        Some(m)
+            if m.role != "owner"
+                && members
+                    .iter()
+                    .any(|m| m.pubkey == target && m.role == "owner") =>
+        {
+            RemoveOtherDecision::Deny
+        }
         Some(m) if m.role == "owner" || m.role == "admin" => RemoveOtherDecision::Allow,
         Some(_) => RemoveOtherDecision::CheckAgentOwner,
         None => RemoveOtherDecision::Deny,
@@ -269,8 +286,8 @@ mod tests {
     type SoleOwnerCase<'a> = (Roster<'a>, u8, bool);
     /// `(roster, actor, expected_error)`.
     type DepartureCase<'a> = (Roster<'a>, u8, Option<ChannelAuthzError>);
-    /// `(roster, actor, actor_relay_role, expected_decision)`.
-    type RemoveOtherCase<'a> = (Roster<'a>, u8, Option<&'a str>, RemoveOtherDecision);
+    /// `(roster, actor, target, actor_relay_role, expected_decision)`.
+    type RemoveOtherCase<'a> = (Roster<'a>, u8, u8, Option<&'a str>, RemoveOtherDecision);
     /// `(policy, owner_tag, actor, expected_error)`.
     type AddPolicyCase<'a> = (&'a str, Option<u8>, u8, Option<ChannelAuthzError>);
 
@@ -503,16 +520,16 @@ mod tests {
                 Some(Member),
                 Err(E::LastOwnerDemotion),
             ),
-            // Another owner demoting the sole owner is impossible (they'd be an
-            // owner too), but an admin demoting the sole owner is not.
+            // An admin cannot demote even one of multiple owners; the
+            // ownership boundary applies before the last-owner guard.
             (
                 "open",
-                &[(1, "owner"), (2, "admin")],
+                &[(1, "owner"), (2, "admin"), (3, "owner")],
                 2,
                 Some(Admin),
                 1,
                 Some(Member),
-                Err(E::LastOwnerDemotion),
+                Err(E::OwnershipChangeDenied),
             ),
             // With a co-owner present the demotion is allowed.
             (
@@ -826,40 +843,41 @@ mod tests {
         use RemoveOtherDecision::{Allow, CheckAgentOwner, Deny};
 
         let cases: &[RemoveOtherCase] = &[
-            // Channel owners and admins may remove anyone.
-            (&[(1, "owner"), (2, "member")], 1, None, Allow),
-            (&[(1, "owner"), (2, "admin")], 2, None, Allow),
-            // A plain member, guest, or bot may only remove an agent they own.
-            (&[(1, "owner"), (2, "member")], 2, None, CheckAgentOwner),
-            (&[(1, "owner"), (2, "guest")], 2, None, CheckAgentOwner),
-            (&[(1, "owner"), (2, "bot")], 2, None, CheckAgentOwner),
-            // A plain `member` relay role grants nothing extra.
-            (
-                &[(1, "owner"), (2, "member")],
-                2,
-                Some("member"),
-                CheckAgentOwner,
-            ),
-            // Non-members are denied without an agent-owner read: you must be
-            // in the channel to remove anyone, even your own bot.
-            (&[(1, "owner")], 9, None, Deny),
-            (&[], 9, None, Deny),
-            (&[(1, "owner")], 9, Some("member"), Deny),
-            // Relay owner/admin hold community-wide authority: allowed from a
-            // plain-member seat (the DM case, where nobody is elevated) and
-            // even when not in the channel, matching moderation_authz.
-            (&[(1, "member"), (2, "member")], 1, Some("owner"), Allow),
-            (&[(1, "member"), (2, "member")], 1, Some("admin"), Allow),
-            (&[(1, "member")], 9, Some("owner"), Allow),
-            (&[(1, "member")], 9, Some("admin"), Allow),
+            // Channel owner may remove channel owners and other roles.
+            (&[(1, "owner"), (2, "owner")], 1, 2, None, Allow),
+            (&[(1, "owner"), (2, "member")], 1, 2, None, Allow),
+            // Channel admins may remove non-owners, not channel owners.
+            (&[(1, "admin"), (2, "member")], 1, 2, None, Allow),
+            (&[(1, "admin"), (2, "admin")], 1, 2, None, Allow),
+            (&[(1, "admin"), (2, "owner"), (3, "owner")], 1, 2, None, Deny),
+            (&[(1, "member"), (2, "owner")], 1, 2, None, Deny),
+            (&[(1, "guest"), (2, "owner")], 1, 2, None, Deny),
+            (&[(1, "bot"), (2, "owner")], 1, 2, None, Deny),
+            // A non-elevated member may remove a non-owner only if agent owner.
+            (&[(1, "owner"), (2, "member")], 2, 1, None, CheckAgentOwner),
+            (&[(1, "owner"), (2, "guest")], 2, 1, None, CheckAgentOwner),
+            (&[(1, "owner"), (2, "bot")], 2, 1, None, CheckAgentOwner),
+            // Relay owner/admin has community-wide authority over non-owners,
+            // including plain-member DMs; it does not bypass owner protection.
+            (&[(1, "member"), (2, "member")], 1, 2, Some("owner"), Allow),
+            (&[(1, "member"), (2, "member")], 1, 2, Some("admin"), Allow),
+            (&[(1, "member"), (2, "owner"), (3, "owner")], 1, 2, Some("owner"), Deny),
+            (&[(1, "member"), (2, "owner")], 9, 2, Some("admin"), Deny),
+            // A plain relay member adds no community-wide authority.
+            (&[(1, "owner"), (2, "member")], 2, 1, Some("member"), CheckAgentOwner),
+            // Non-members are denied, including relay members who are not
+            // owner/admin, and cannot reach agent-owner authorization.
+            (&[(1, "owner")], 9, 1, None, Deny),
+            (&[], 9, 1, None, Deny),
+            (&[(1, "member"), (2, "member")], 9, 2, Some("member"), Deny),
         ];
 
-        for (entries, actor, relay_role, expected) in cases {
+        for (entries, actor, target, relay_role, expected) in cases {
             let members = roster(entries);
             assert_eq!(
-                classify_remove_other(&members, &pk(*actor), *relay_role),
+                classify_remove_other(&members, &pk(*actor), &pk(*target), *relay_role),
                 *expected,
-                "roster {entries:?} actor {actor} relay_role {relay_role:?}"
+                "roster {entries:?} actor {actor} target {target} relay_role {relay_role:?}"
             );
         }
     }
@@ -880,6 +898,10 @@ mod tests {
             (
                 ChannelAuthzError::RoleChangeDenied,
                 "only owners/admins may change an active member's role",
+            ),
+            (
+                ChannelAuthzError::OwnershipChangeDenied,
+                "only owners may grant ownership or change an owner's role",
             ),
             (
                 ChannelAuthzError::LastOwnerDemotion,
