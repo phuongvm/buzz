@@ -13,6 +13,7 @@ use crate::{
     },
     grant::GrantKeyring,
     model::*,
+    signed_call_limiter::SignedCallLimiter,
     token::TokenKeyring,
 };
 use axum::{
@@ -66,6 +67,8 @@ pub struct AppState {
     pub max_installation_lifetime_seconds: i64,
     pub endpoint_quota_window_seconds: i64,
     pub endpoint_quota_max_deliveries: i64,
+    /// Limits signed installation calls per attested key.
+    pub signed_calls: Arc<SignedCallLimiter>,
     pub now: fn() -> i64,
     pub accepting: Arc<AtomicBool>,
 }
@@ -145,7 +148,7 @@ fn authority_error(e: AuthorityError) -> Response {
         AuthorityError::Rejected => error(StatusCode::NOT_FOUND, "not_authorized"),
         AuthorityError::Conflict => installation_conflict(),
         AuthorityError::RateLimited => error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-        AuthorityError::Unavailable => {
+        AuthorityError::Unavailable | AuthorityError::InFlight => {
             error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
         }
     }
@@ -245,6 +248,11 @@ struct EnrollTranscript<'a> {
 /// Domain of the Android enrollment transcript, which the attestation
 /// challenge binds.
 const ANDROID_ENROLL_DOMAIN: &str = "buzz.push.enroll.android.v1";
+/// How long a relay should wait before retrying a request whose earlier
+/// attempt is still in flight. Long enough for a send that is minting or
+/// waiting on the push service to finish, short enough to keep wakes prompt.
+/// The relay backs off from this value; its schedule lives in the relay.
+const IN_FLIGHT_RETRY_AFTER_SECONDS: i64 = 5;
 
 /// The Android enrollment transcript: the iOS one without `key_id`, since the
 /// key is generated after (and from) this transcript's digest.
@@ -513,6 +521,11 @@ async fn verify_installation_assertion<T: serde::Serialize>(
             None
         }
     };
+    // Counted only for authentic calls, so nobody can spend another
+    // installation's allowance with forged requests.
+    if !s.signed_calls.admit(&installation.app_attest_key_id, now) {
+        return Err(error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    }
     s.authority
         .consume_challenge(challenge.id, challenge_bytes, now)
         .await
@@ -895,6 +908,19 @@ async fn deliver(
             crate::metrics::record_delivery_error("temporarily_unavailable");
             return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
         }
+        // The relay gave up waiting on an earlier attempt of this request and
+        // retried while that attempt is still sending. A 404 here would tell
+        // the relay the wake was delivered; ask it to retry instead, after the
+        // first attempt has had time to finish.
+        Err(AuthorityError::InFlight) => {
+            crate::metrics::record_admission(crate::metrics::Admission::InFlight);
+            return delivery_outcome_response(
+                DeliveryOutcome::Retry {
+                    retry_after_seconds: Some(IN_FLIGHT_RETRY_AFTER_SECONDS),
+                },
+                grant.generation,
+            );
+        }
     };
     let platform = permit.authority.platform;
     // An Android installation can exist only on a gateway configured for
@@ -948,13 +974,19 @@ async fn deliver(
             | DeliveryOutcome::InvalidEndpoint { .. }
             | DeliveryOutcome::PermanentRequestFault => DeliveryDisposition::Terminal,
         };
-        authority_store
-            .finish_delivery(permit, disposition)
-            .await
-            .map(|()| outcome)
+        let finished = authority_store.finish_delivery(permit, disposition).await;
+        (outcome, disposition, finished)
     });
     let outcome = match delivery.await {
-        Ok(Ok(outcome)) => outcome,
+        Ok((outcome, _, Ok(()))) => outcome,
+        // The provider has answered for good, so report that answer. The id
+        // stays in flight until its request expires, which only makes a
+        // replay retry later; it can never cause a second send.
+        Ok((outcome, DeliveryDisposition::Terminal, Err(err))) => {
+            crate::metrics::record_delivery_error("finish_failed");
+            tracing::warn!(error = %err, "failed to mark a terminal delivery finished");
+            outcome
+        }
         _ => {
             crate::metrics::record_delivery_error("finish_failed");
             return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
@@ -1109,6 +1141,9 @@ mod request_limit_tests {
             max_installation_lifetime_seconds: 86_400,
             endpoint_quota_window_seconds: 60,
             endpoint_quota_max_deliveries: 10,
+            signed_calls: Arc::new(crate::signed_call_limiter::SignedCallLimiter::new(
+                60, 1_000,
+            )),
             now: fixed_now,
             accepting: Arc::new(AtomicBool::new(true)),
         }

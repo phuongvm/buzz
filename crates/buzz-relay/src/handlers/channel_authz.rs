@@ -854,9 +854,9 @@ mod tests {
             (&[(1, "guest"), (2, "owner")], 1, 2, None, Deny),
             (&[(1, "bot"), (2, "owner")], 1, 2, None, Deny),
             // A non-elevated member may remove a non-owner only if agent owner.
-            (&[(1, "owner"), (2, "member")], 2, 1, None, CheckAgentOwner),
-            (&[(1, "owner"), (2, "guest")], 2, 1, None, CheckAgentOwner),
-            (&[(1, "owner"), (2, "bot")], 2, 1, None, CheckAgentOwner),
+            (&[(1, "member"), (2, "bot")], 1, 2, None, CheckAgentOwner),
+            (&[(1, "guest"), (2, "bot")], 1, 2, None, CheckAgentOwner),
+            (&[(1, "bot"), (2, "bot")], 1, 2, None, CheckAgentOwner),
             // Relay owner/admin has community-wide authority over non-owners,
             // including plain-member DMs; it does not bypass owner protection.
             (&[(1, "member"), (2, "member")], 1, 2, Some("owner"), Allow),
@@ -864,7 +864,7 @@ mod tests {
             (&[(1, "member"), (2, "owner"), (3, "owner")], 1, 2, Some("owner"), Deny),
             (&[(1, "member"), (2, "owner")], 9, 2, Some("admin"), Deny),
             // A plain relay member adds no community-wide authority.
-            (&[(1, "owner"), (2, "member")], 2, 1, Some("member"), CheckAgentOwner),
+            (&[(1, "member"), (2, "bot")], 1, 2, Some("member"), CheckAgentOwner),
             // Non-members are denied, including relay members who are not
             // owner/admin, and cannot reach agent-owner authorization.
             (&[(1, "owner")], 9, 1, None, Deny),
